@@ -1,0 +1,608 @@
+#include "parser/lexer.h"
+#include "query/executor.h"
+#include "expiration/expiry.h"
+
+#include <fstream>
+#include <cstring>
+#include <stdexcept>
+#include <algorithm>
+
+#include <dirent.h>
+#include <sys/stat.h>
+
+using namespace std;
+
+bool Field_Matches(const Field &f, const string &op, const string &val)
+{
+    if (f.is_null)
+        return false;
+
+    switch (f.column_type)
+    {
+    case ColType::INT:
+    {
+        int32_t v = stoi(val);
+        if (op == "=")
+            return f.integer_value == v;
+        if (op == "!=")
+            return f.integer_value != v;
+        if (op == "<")
+            return f.integer_value < v;
+        if (op == ">")
+            return f.integer_value > v;
+        if (op == "<=")
+            return f.integer_value <= v;
+        if (op == ">=")
+            return f.integer_value >= v;
+
+        break;
+    }
+    case ColType::DECIMAL:
+    {
+        double v = stod(val);
+        if (op == "=")
+            return f.double_value == v;
+        if (op == "!=")
+            return f.double_value != v;
+        if (op == "<")
+            return f.double_value < v;
+        if (op == ">")
+            return f.double_value > v;
+        if (op == "<=")
+            return f.double_value <= v;
+        if (op == ">=")
+            return f.double_value >= v;
+
+        break;
+    }
+    case ColType::VARCHAR:
+    {
+        if (op == "=")
+            return f.string_value == val;
+        if (op == "!=")
+            return f.string_value != val;
+        if (op == "<")
+            return f.string_value < val;
+        if (op == ">")
+            return f.string_value > val;
+        if (op == "<=")
+            return f.string_value <= val;
+        if (op == ">=")
+            return f.string_value >= val;
+        break;
+    }
+    case ColType::BOOLEAN:
+    {
+        bool v = (val == "1" || val == "true" || val == "TRUE" || val == "yes");
+        if (op == "=")
+            return f.boolean_value == v;
+        if (op == "!=")
+            return f.boolean_value != v;
+
+        break;
+    }
+    }
+
+    return false;
+}
+
+ResultRow Project_Row(const Row &row, const TableSchema &sc, const vector<ColumnReference> &sel_cols, bool sel_star, const string &tbl_prefix)
+{
+    ResultRow res;
+    if (sel_star)
+    {
+        for (uint32_t i = 0; i < sc.num_cols; i++)
+        {
+            string cn = sc.cols[i].name;
+            if (!tbl_prefix.empty())
+                cn = tbl_prefix + "." + cn;
+            res.column_names.push_back(cn);
+            res.values.push_back(row.fields[i].Convert_To_String());
+        }
+    }
+    else
+    {
+        for (auto &cr : sel_cols)
+        {
+            if (!cr.tbl.empty() && !tbl_prefix.empty())
+            {
+                string a = cr.tbl, b = tbl_prefix;
+                if (a != b)
+                    continue;
+            }
+
+            int idx = sc.Find_Column(cr.col);
+            if (idx < 0)
+                continue;
+
+            res.column_names.push_back(cr.col);
+            res.values.push_back(row.fields[idx].Convert_To_String());
+        }
+    }
+    return res;
+}
+
+Database::Database(const string &root_dir, const string &db_name) : database_name(db_name), database_directory(root_dir + "/" + db_name)
+{
+    mkdir(database_directory.c_str(), 0755);
+}
+
+void Database::Flush_DB()
+{
+    shared_lock lk(tables_mutex);
+    for (auto &[n, t] : tables)
+    {
+        lock_guard tl(t->table_mutex);
+        t->Flush_Table();
+    }
+}
+
+TableManager *Database::Get_Table(const string &name)
+{
+    {
+        shared_lock lk(tables_mutex);
+        auto it = tables.find(name);
+        if (it != tables.end())
+            return it->second.get();
+    }
+
+    ifstream sf(database_directory + "/" + name + ".schema", ios::binary);
+    if (!sf.is_open())
+        return nullptr;
+
+    TableSchema sc;
+    sf.read(reinterpret_cast<char *>(&sc), sizeof(sc));
+
+    unique_lock lk(tables_mutex);
+    auto it = tables.find(name);
+    if (it != tables.end())
+        return it->second.get();
+
+    tables[name] = make_unique<TableManager>(database_directory, name, sc, false);
+    return tables[name].get();
+}
+
+vector<string> Database::Table_Names()
+{
+    vector<string> names;
+    DIR *d = opendir(database_directory.c_str());
+    if (!d)
+        return names;
+
+    struct dirent *e;
+    while ((e = readdir(d)) != nullptr)
+    {
+        string fn = e->d_name;
+        if (fn.size() > 7 && fn.substr(fn.size() - 7) == ".schema")
+            names.push_back(fn.substr(0, fn.size() - 7));
+    }
+
+    closedir(d);
+    sort(names.begin(), names.end());
+
+    return names;
+}
+
+// ── CREATE TABLE ─────────────────────────────────────────────
+string Database::Execute_Create(const ParsedQuery &q)
+{
+    string tn = q.table_name;
+    {
+        shared_lock lk(tables_mutex);
+        if (tables.count(tn))
+        {
+            if (q.if_not_exists)
+                return "OK: Table '" + tn + "' already exists (ignored).";
+            return "ERROR: Table '" + tn + "' already exists.";
+        }
+    }
+    ifstream sf(database_directory + "/" + tn + ".schema", ios::binary);
+    if (sf.is_open())
+    {
+        if (q.if_not_exists)
+            return "OK: Table '" + tn + "' already exists (ignored).";
+        return "ERROR: Table '" + tn + "' already exists on disk.";
+    }
+
+    TableSchema sc;
+    memset(&sc, 0, sizeof(sc));
+    strncpy(sc.table_name, tn.c_str(), MAX_NAME - 1);
+    sc.num_cols = (uint32_t)q.col_defs.size();
+    for (uint32_t i = 0; i < sc.num_cols; i++)
+    {
+        auto &cd = q.col_defs[i];
+        strncpy(sc.cols[i].name, cd.name.c_str(), MAX_NAME - 1);
+        sc.cols[i].is_primary_key = cd.pk;
+        sc.cols[i].not_null = cd.notnull;
+        if (cd.type == "INT")
+        {
+            sc.cols[i].type = ColType::INT;
+            sc.cols[i].max_size = 8;
+        }
+        else if (cd.type == "DECIMAL")
+        {
+            sc.cols[i].type = ColType::DECIMAL;
+            sc.cols[i].max_size = 8;
+        }
+        else if (cd.type == "BOOLEAN")
+        {
+            sc.cols[i].type = ColType::BOOLEAN;
+            sc.cols[i].max_size = 1;
+        }
+        else if (cd.type == "TEXT")
+        {
+            sc.cols[i].type = ColType::VARCHAR;
+            sc.cols[i].max_size = 65535;
+        }
+        else
+        {
+            sc.cols[i].type = ColType::VARCHAR;
+            sc.cols[i].max_size = cd.vsz > 0 ? cd.vsz : 255;
+        }
+    }
+
+    unique_lock lk(tables_mutex);
+    tables[tn] = make_unique<TableManager>(database_directory, tn, sc, true);
+    return "OK: Table '" + tn + "' created.";
+}
+
+// ── INSERT (batch-capable) ────────────────────────────────────
+string Database::Execute_Insert(const ParsedQuery &q)
+{
+    string tn = q.table_name;
+    TableManager *tm = Get_Table(tn);
+    if (!tm)
+        return "ERROR: Table '" + tn + "' not found.";
+
+    auto &sc = tm->schema;
+    lock_guard tl(tm->table_mutex);
+
+    int inserted = 0;
+    for (auto &vals : q.inserted_rows)
+    {
+        if ((uint32_t)vals.size() != sc.num_cols)
+            return "ERROR: Expected " + to_string(sc.num_cols) + " values, got " + to_string(vals.size()) + ".";
+
+        Row row;
+        for (uint32_t i = 0; i < sc.num_cols; i++)
+            row.fields.push_back(Make_Field(vals[i], sc.cols[i]));
+
+        row.expiry_timestamp = Make_Expiry(q.expiry_secs);
+        tm->Insert_Row(row);
+        inserted++;
+    }
+
+    return "OK: " + to_string(inserted) + " row(s) inserted.";
+}
+
+// ── SELECT ────────────────────────────────────────────────────
+string Database::Execute_Select(const ParsedQuery &q, RowCB cb)
+{
+    string tn = q.from_table;
+    TableManager *tm = Get_Table(tn);
+    if (!tm)
+        return "ERROR: Table '" + tn + "' not found.";
+
+    // Validate projected columns exist (non-star, non-join queries)
+    if (!q.select_star && !q.has_join)
+    {
+        for (auto &cr : q.selected_columns)
+        {
+            if (!cr.tbl.empty())
+                continue; // qualified refs handled at join time
+            int idx = tm->schema.Find_Column(cr.col);
+            if (idx < 0)
+                return "ERROR: Unknown column '" + cr.col +
+                       "' in table '" + tn + "'.";
+        }
+    }
+
+    // ── Helper: apply ORDER BY to collected rows ──────────────
+    auto applyOrder = [&](vector<ResultRow> &rows)
+    {
+        if (!q.has_order)
+            return;
+        bool desc = q.order.desc;
+        string col = q.order.col.col;
+        stable_sort(rows.begin(), rows.end(),
+                    [&](const ResultRow &a, const ResultRow &b)
+                    {
+                        int idx = -1;
+                        for (int i = 0; i < (int)a.column_names.size(); i++)
+                        {
+                            string cn = a.column_names[i];
+                            if (cn == col || cn.find('.' + col) != string::npos)
+                            {
+                                idx = i;
+                                break;
+                            }
+                        }
+                        if (idx < 0)
+                            return false;
+                        const string &va = a.values[idx];
+                        const string &vb = b.values[idx];
+                        // Try numeric compare
+                        try
+                        {
+                            double da = stod(va), db = stod(vb);
+                            return desc ? da > db : da < db;
+                        }
+                        catch (...)
+                        {
+                        }
+                        return desc ? va > vb : va < vb;
+                    });
+    };
+
+    // ── INNER JOIN path ───────────────────────────────────────
+    if (q.has_join)
+    {
+        string jn = q.join.jtbl;
+        TableManager *jt = Get_Table(jn);
+        if (!jt)
+            return "ERROR: Table '" + jn + "' not found.";
+
+        vector<ResultRow> results;
+
+        lock_guard tl(tm->table_mutex);
+        lock_guard jl(jt->table_mutex);
+
+        tm->Scan([&](const Row &lr) -> bool {
+            jt->Scan([&](const Row &rr) -> bool {
+                int li = tm->schema.Find_Column(q.join.left.col);
+                int ri = jt->schema.Find_Column(q.join.right.col);
+
+                if (li < 0 || ri < 0) return true;
+                if (lr.fields[li].Convert_To_String() != rr.fields[ri].Convert_To_String()) return true;
+
+                // WHERE filter
+                if (q.has_where)
+                {
+                    string wt = q.where.col.tbl;
+                    string wcol = q.where.col.col;
+                    // Try left table
+                    int ci = tm->schema.Find_Column(wcol);
+                    if (ci >= 0 && (wt == tn || wt.empty()))
+                        if (!Field_Matches(lr.fields[ci], q.where.op, q.where.val)) return true;
+                    // Try right table
+                    ci = jt->schema.Find_Column(wcol);
+                    if (ci >= 0 && (wt == jn || wt.empty()))
+                        if (!Field_Matches(rr.fields[ci], q.where.op, q.where.val)) return true;
+                }
+
+                ResultRow res;
+                auto rl  = Project_Row(lr, tm->schema, q.selected_columns, q.select_star, tn);
+                auto rr2 = Project_Row(rr, jt->schema, q.selected_columns, q.select_star, jn);
+
+                for (auto &c : rl.column_names)  res.column_names.push_back(c);
+                for (auto &v : rl.values)     res.values.push_back(v);
+                for (auto &c : rr2.column_names) res.column_names.push_back(c);
+                for (auto &v : rr2.values)    res.values.push_back(v);
+
+                results.push_back(move(res));
+                return true;
+            });
+
+            return true; });
+
+        applyOrder(results);
+        for (auto &r : results)
+            if (!cb(r))
+                break;
+
+        return "OK: " + to_string(results.size()) + " row(s) returned.";
+    }
+
+    // ── Single-table path ─────────────────────────────────────
+    int rows = 0;
+    int pk = tm->schema.Primary_Key_Column();
+
+    // B+ Tree point lookup: only when = on PK column (INT or DECIMAL)
+    bool use_ix = q.has_where && q.where.op == "=" && q.where.col.tbl.empty() && (strcasecmp(q.where.col.col.c_str(), tm->schema.cols[pk].name) == 0) && !q.has_order;
+    if (use_ix)
+    {
+        lock_guard tl(tm->table_mutex);
+        Row row;
+        // Support both INT and DECIMAL primary keys
+        int32_t key = (int32_t)stod(q.where.val);
+        if (tm->Find_By_FK(key, row))
+        {
+            rows++;
+            cb(Project_Row(row, tm->schema, q.selected_columns, q.select_star));
+        }
+        return "OK: " + to_string(rows) + " row(s) returned. [B+ Tree index]";
+    }
+
+    // Full scan (with optional ORDER BY)
+    // We keep (sort_key_string, ResultRow) so ORDER BY works even
+    // when the sort column is not part of the projected output.
+    struct SortRow
+    {
+        string sort_key;
+        bool sort_key_numeric = false;
+        double sort_key_dbl = 0.0;
+        ResultRow rr;
+    };
+    vector<SortRow> results;
+
+    // Determine sort column index in the raw table (before projection)
+    int sort_col_idx = -1;
+    if (q.has_order)
+        sort_col_idx = tm->schema.Find_Column(q.order.col.col);
+
+    {
+        lock_guard tl(tm->table_mutex);
+        tm->Scan([&](const Row &row) -> bool
+                 {
+            if (q.has_where)
+            {
+                int ci = tm->schema.Find_Column(q.where.col.col);
+                if (ci < 0 || !Field_Matches(row.fields[ci], q.where.op, q.where.val))
+                    return true;
+            }
+
+            SortRow sr;
+            sr.rr = Project_Row(row, tm->schema, q.selected_columns, q.select_star);
+            if (sort_col_idx >= 0 && sort_col_idx < (int)row.fields.size())
+            {
+                sr.sort_key = row.fields[sort_col_idx].Convert_To_String();
+                try {
+                    sr.sort_key_dbl     = stod(sr.sort_key);
+                    sr.sort_key_numeric = true;
+                } catch (...) {}
+            }
+
+            results.push_back(move(sr));
+            return true; 
+        });
+    }
+
+    if (q.has_order)
+    {
+        bool desc = q.order.desc;
+        stable_sort(results.begin(), results.end(), [&](const SortRow &a, const SortRow &b)
+                    {
+            if (a.sort_key_numeric && b.sort_key_numeric)
+                return desc ? a.sort_key_dbl > b.sort_key_dbl : a.sort_key_dbl < b.sort_key_dbl;
+
+            return desc ? a.sort_key > b.sort_key : a.sort_key < b.sort_key; });
+    }
+
+    for (auto &sr : results)
+    {
+        rows++;
+        if (!cb(sr.rr))
+            break;
+    }
+
+    return "OK: " + to_string(rows) + " row(s) returned.";
+}
+
+// ── DELETE ────────────────────────────────────────────────────
+string Database::Execute_Delete(const ParsedQuery &q)
+{
+    string tn = q.table_name;
+    TableManager *tm = Get_Table(tn);
+    if (!tm)
+        return "ERROR: Table '" + tn + "' not found.";
+
+    lock_guard tl(tm->table_mutex);
+    if (!q.has_where)
+    {
+        tm->Delete_All();
+        return "OK: All rows deleted.";
+    }
+
+    int deleted = tm->Delete_Where([&](const Row &row) -> bool
+                                  {
+        int ci = tm->schema.Find_Column(q.where.col.col);
+        if (ci < 0) return false;
+        return Field_Matches(row.fields[ci], q.where.op, q.where.val); });
+
+    return "OK: " + to_string(deleted) + " row(s) deleted.";
+}
+
+// ── execute ───────────────────────────────────────────────────
+string Database::Execute(const string &sql, RowCB cb)
+{
+    try
+    {
+        Lexer lx(sql);
+        auto toks = lx.Tokenize();
+        Parser pr(move(toks));
+        ParsedQuery q = pr.Parse();
+        if (!cb)
+            cb = [](const ResultRow &)
+            { return true; };
+
+        switch (q.type)
+        {
+        case QueryType::CREATE_TABLE:
+            return Execute_Create(q);
+        case QueryType::INSERT:
+            return Execute_Insert(q);
+        case QueryType::SELECT:
+            return Execute_Select(q, cb);
+        case QueryType::DELETE_ROWS:
+            return Execute_Delete(q);
+        default:
+            return "ERROR: Query not valid in this context.";
+        }
+    }
+    catch (exception &e)
+    {
+        return string("ERROR: ") + e.what();
+    }
+}
+
+DatabaseManager::DatabaseManager(const string &root_dir) : root_directory(root_dir)
+{
+    mkdir(root_directory.c_str(), 0755);
+}
+
+string DatabaseManager::Create_Database(const string &name)
+{
+    struct stat st;
+    string path = root_directory + "/" + name;
+    if (stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+        return "ERROR: Database '" + name + "' already exists.";
+
+    mkdir(path.c_str(), 0755);
+    return "OK: Database '" + name + "' created.";
+}
+
+vector<string> DatabaseManager::List_Databases()
+{
+    vector<string> names;
+    DIR *d = opendir(root_directory.c_str());
+    if (!d)
+        return names;
+
+    struct dirent *e;
+    while ((e = readdir(d)) != nullptr)
+    {
+        string fn = e->d_name;
+        if (fn == "." || fn == "..")
+            continue;
+
+        struct stat st;
+        string full = root_directory + "/" + fn;
+        if (stat(full.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+            names.push_back(fn);
+    }
+
+    closedir(d);
+    sort(names.begin(), names.end());
+
+    return names;
+}
+
+Database *DatabaseManager::Get_Database(const string &name)
+{
+    {
+        lock_guard lk(database_mutex);
+        auto it = databases.find(name);
+        if (it != databases.end())
+            return it->second.get();
+    }
+
+    string path = root_directory + "/" + name;
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0 || !S_ISDIR(st.st_mode))
+        return nullptr;
+
+    lock_guard lk(database_mutex);
+    auto it = databases.find(name);
+    if (it != databases.end())
+        return it->second.get();
+
+    databases[name] = make_unique<Database>(root_directory, name);
+    return databases[name].get();
+}
+
+void DatabaseManager::Flush_DB_Manager()
+{
+    lock_guard lk(database_mutex);
+    for (auto &[n, db] : databases)
+        db->Flush_DB();
+}
