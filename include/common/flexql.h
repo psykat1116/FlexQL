@@ -5,6 +5,11 @@
 
 typedef struct
 {
+    long long rows = 0;
+} QueryStats;
+
+typedef struct
+{
     int port;
     int serverfd;
     char host[256];

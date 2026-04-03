@@ -34,10 +34,11 @@ void TableManager::Ensure_Capacity()
         return;
 
     allocated_pages = number_of_pages + PREALLOC_PAGES;
-    ::ftruncate(table_fd, (off_t)allocated_pages * PAGE_SIZE);
+    if (::ftruncate(table_fd, (off_t)allocated_pages * PAGE_SIZE) != 0)
+        throw std::runtime_error("Failed to truncate table file: disk full or permission denied.");
 }
 
-TableManager::TableManager(const std::string &dir, const std::string &table_name, const TableSchema &sc, bool create_new) : cache(CACHE_CAPACITY), directory(dir)
+TableManager::TableManager(const std::string &dir, const std::string &table_name, const TableSchema &sc, bool create_new) : directory(dir), cache(CACHE_CAPACITY)
 {
     schema = sc;
     table_path = dir + "/" + table_name + ".tbl";
@@ -65,7 +66,21 @@ TableManager::TableManager(const std::string &dir, const std::string &table_name
             allocated_pages = number_of_pages;
         }
 
-        btree.Load_Tree(index_path);
+        // Load saved index if the .idx file exists.
+        // If it is absent (server killed before first clean flush), rebuild
+        // the index by scanning the raw .tbl pages so every query that
+        // follows can use the B+ Tree rather than doing a full table scan.
+        std::ifstream idx_check(index_path, std::ios::binary);
+        if (idx_check.is_open())
+        {
+            idx_check.close();
+            btree.Load_Tree(index_path);
+        }
+        else
+        {
+            Rebuild_Index();
+            btree.Save_Tree(index_path);
+        }
     }
 }
 
@@ -79,9 +94,12 @@ void TableManager::Flush_Table()
 {
     cache.Flush_All([this](uint32_t pid, const Page &pg)
                     { Write_To_Disk(pid, pg); });
+
     if (table_fd >= 0 && number_of_pages < allocated_pages)
     {
-        ::ftruncate(table_fd, (off_t)number_of_pages * PAGE_SIZE);
+        if (::ftruncate(table_fd, (off_t)allocated_pages * PAGE_SIZE) != 0)
+            throw std::runtime_error("Failed to truncate table file: disk full or permission denied.");
+
         allocated_pages = number_of_pages;
     }
 
@@ -159,6 +177,22 @@ bool TableManager::Find_By_FK(int32_t key, Row &out_row)
     return !Has_Expired(out_row.expiry_timestamp);
 }
 
+std::vector<Row> TableManager::Find_By_Range(int32_t lo, bool lo_inc, int32_t hi, bool hi_inc)
+{
+    std::vector<Row> results;
+    for (const IndexRecord &rec : btree.Find_Range(lo, lo_inc, hi, hi_inc))
+    {
+        Page &pg = Fetch_Page(rec.page_id);
+        const uint8_t *raw = pg.getRow(rec.slot_idx);
+        if (!raw)
+            continue;
+        Row row = Deserialize_Row(raw, schema);
+        if (!Has_Expired(row.expiry_timestamp))
+            results.push_back(std::move(row));
+    }
+    return results;
+}
+
 void TableManager::Scan(std::function<bool(const Row &)> cb)
 {
     for (uint32_t pid = 0; pid < number_of_pages; pid++)
@@ -178,11 +212,35 @@ void TableManager::Scan(std::function<bool(const Row &)> cb)
     }
 }
 
+void TableManager::Rebuild_Index()
+{
+    btree.Clear_Tree();
+    int pk_col = schema.Primary_Key_Column();
+
+    for (uint32_t pid = 0; pid < number_of_pages; pid++)
+    {
+        Page pg;
+        Read_From_Disk(pid, pg);
+        for (int s = 0; s < pg.Number_Of_Slots(); s++)
+        {
+            const uint8_t *raw = pg.getRow(s);
+            if (!raw)
+                continue;
+            Row row = Deserialize_Row(raw, schema);
+            if (Has_Expired(row.expiry_timestamp))
+                continue;
+            if (pk_col < (int)row.fields.size() && !row.fields[pk_col].is_null)
+                btree.Insert_Key(row.fields[pk_col].integer_value, pid, (uint16_t)s);
+        }
+    }
+}
+
 void TableManager::Delete_All()
 {
     cache.Flush_All([](uint32_t, const Page &) {});
     if (table_fd >= 0)
-        ::ftruncate(table_fd, 0);
+        if (::ftruncate(table_fd, 0) != 0)
+            throw std::runtime_error("Failed to truncate table file to 0 bytes.");
 
     number_of_pages = 0;
     allocated_pages = 0;
@@ -200,7 +258,8 @@ int TableManager::Delete_Where(std::function<bool(const Row &)> pred)
     int deleted = (int)btree.Get_Size() - (int)survivors.size();
     cache.Flush_All([](uint32_t, const Page &) {});
     if (table_fd >= 0)
-        ::ftruncate(table_fd, 0);
+        if (::ftruncate(table_fd, 0) != 0)
+            throw std::runtime_error("Failed to truncate table file to 0 bytes.");
 
     number_of_pages = 0;
     allocated_pages = 0;
@@ -211,15 +270,14 @@ int TableManager::Delete_Where(std::function<bool(const Row &)> pred)
     return deleted;
 }
 
-uint32_t TableManager::Page_Count() const { return number_of_pages; }
-uint32_t TableManager::Row_Count() const { return (uint32_t)btree.Get_Size(); }
-
 void TableManager::Write_To_Disk(uint32_t page_id, const Page &pg)
 {
     if (table_fd < 0)
         Open_FD(false);
 
-    ::pwrite(table_fd, pg.data, PAGE_SIZE, (off_t)page_id * PAGE_SIZE);
+    ssize_t bytes_written = ::pwrite(table_fd, pg.data, PAGE_SIZE, (off_t)page_id * PAGE_SIZE);
+    if (bytes_written != PAGE_SIZE)
+        throw runtime_error("Failed to write page to disk: incomplete write or I/O error.");
 }
 
 void TableManager::Read_From_Disk(uint32_t page_id, Page &pg)

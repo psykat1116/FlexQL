@@ -1,4 +1,5 @@
 #pragma once
+#include <vector>
 #include <map>
 #include <string>
 #include <cstdint>
@@ -25,4 +26,5 @@ public:
     void Load_Tree(const string &path);
     void Save_Tree(const string &path) const;
     bool Find_Key(int32_t key, IndexRecord &rec) const;
+    vector<IndexRecord> Find_Range(int32_t lo, bool lo_inclusive, int32_t hi, bool hi_inclusive) const;
 };

@@ -38,7 +38,6 @@ typedef struct
     ColSchema cols[MAX_COLS];
     char table_name[MAX_NAME];
 
-    // Find Column index by name (case-insensitive). Returns -1 if not found.
     int Find_Column(const string &n) const
     {
         for (uint32_t i = 0; i < num_cols; i++)
@@ -48,7 +47,6 @@ typedef struct
         return -1;
     }
 
-    // Find Primary Key column index. Returns 0 if no primary key defined.
     int Primary_Key_Column() const
     {
         for (uint32_t i = 0; i < num_cols; i++)

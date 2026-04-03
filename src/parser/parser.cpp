@@ -76,13 +76,13 @@ std::string Parser::Token_To_TypeName(TT t)
     case TT::TDECIMAL:
         return "DECIMAL";
     case TT::TFLOAT:
-        return "DECIMAL"; // FLOAT → stored as DECIMAL
+        return "DECIMAL"; // FLOAT to stored as DECIMAL
     case TT::TREAL:
-        return "DECIMAL"; // REAL  → stored as DECIMAL
+        return "DECIMAL"; // REAL to stored as DECIMAL
     case TT::TVARCHAR:
         return "VARCHAR";
     case TT::TTEXT:
-        return "TEXT"; // TEXT  → large VARCHAR
+        return "TEXT"; // TEXT to large VARCHAR
     case TT::TBOOLEAN:
         return "BOOLEAN";
     default:
@@ -90,11 +90,9 @@ std::string Parser::Token_To_TypeName(TT t)
     }
 }
 
-// ── CREATE TABLE [IF NOT EXISTS] | CREATE DATABASE ────────────
 ParsedQuery Parser::Parse_Create()
 {
-    Consume(); // eat CREATE
-
+    Consume();
     if (Cur().type == TT::DATABASE)
     {
         Consume();
@@ -170,10 +168,9 @@ ParsedQuery Parser::Parse_Create()
     return q;
 }
 
-// ── INSERT INTO table VALUES (r1),(r2),... [EXPIRY N] ─────────
 ParsedQuery Parser::Parse_Insert()
 {
-    Consume(); // eat INSERT
+    Consume();
     Expect(TT::INTO);
     ParsedQuery q;
     q.type = QueryType::INSERT;
@@ -211,10 +208,9 @@ ParsedQuery Parser::Parse_Insert()
     return q;
 }
 
-// ── SELECT ────────────────────────────────────────────────────
 ParsedQuery Parser::Parse_Select()
 {
-    Consume(); // eat SELECT
+    Consume();
     ParsedQuery q;
     q.type = QueryType::SELECT;
 
@@ -255,6 +251,12 @@ ParsedQuery Parser::Parse_Select()
         Consume();
         q.has_where = true;
         q.where = Parse_Where();
+        q.where_list.push_back(q.where);
+        while (Cur().type == TT::AND)
+        {
+            Consume();
+            q.where_list.push_back(Parse_Where());
+        }
     }
 
     if (Cur().type == TT::ORDER)
@@ -278,10 +280,9 @@ ParsedQuery Parser::Parse_Select()
     return q;
 }
 
-// ── DELETE FROM table [WHERE ...] ─────────────────────────────
 ParsedQuery Parser::Parse_Delete()
 {
-    Consume(); // eat DELETE
+    Consume();
     Expect(TT::FROM);
     ParsedQuery q;
     q.type = QueryType::DELETE_ROWS;
@@ -296,7 +297,6 @@ ParsedQuery Parser::Parse_Delete()
     return q;
 }
 
-// ── SHOW ──────────────────────────────────────────────────────
 ParsedQuery Parser::Parse_Show()
 {
     Consume();
@@ -317,7 +317,6 @@ ParsedQuery Parser::Parse_Show()
     return q;
 }
 
-// ── USE ───────────────────────────────────────────────────────
 ParsedQuery Parser::Parse_Use()
 {
     Consume();
@@ -327,7 +326,6 @@ ParsedQuery Parser::Parse_Use()
     return q;
 }
 
-// ── Main dispatch ─────────────────────────────────────────────
 ParsedQuery Parser::Parse()
 {
     ParsedQuery q;

@@ -1,16 +1,3 @@
-/*
- * ================================================================
- *  flexql_client.cpp
- *
- *  Implements the four public functions declared in flexql.h.
- *  The FlexQL struct internals are defined here only (opaque).
- *
- *  On flexql_open(), automatically creates and selects a default
- *  database ("flexqldb") so the benchmark can call flexql_exec()
- *  immediately without a separate USE statement.
- * ================================================================
- */
-
 #include "common/flexql.h"
 #include "network/net_utils.h"
 #include "common/flexql_protocol.h"
@@ -27,8 +14,7 @@
 #include <cstring>
 #include <cstdlib>
 
-// ── Unpack null-separated payload → malloc'd C strings ───────
-static char **unpackToC(const std::string &payload, int *count)
+static char **Unpack_To_C(const std::string &payload, int *count)
 {
     int n = 0;
     for (char c : payload)
@@ -59,17 +45,15 @@ static char **unpackToC(const std::string &payload, int *count)
     return arr;
 }
 
-static void freeC(char **arr, int count)
+static void Free_C(char **arr, int count)
 {
-    if (!arr)
-        return;
+    if (!arr) return;
     for (int i = 0; i < count; i++)
         free(arr[i]);
 
     free(arr);
 }
 
-// ── flexql_open ───────────────────────────────────────────────
 int flexql_open(const char *host, int port, FlexQL **db)
 {
     if (!host || !db)
@@ -104,7 +88,6 @@ int flexql_open(const char *host, int port, FlexQL **db)
     return FLEXQL_OK;
 }
 
-// ── flexql_close ─────────────────────────────────────────────
 int flexql_close(FlexQL *db)
 {
     if (!db)
@@ -116,7 +99,6 @@ int flexql_close(FlexQL *db)
     return FLEXQL_OK;
 }
 
-// ── flexql_exec ──────────────────────────────────────────────
 int flexql_exec(FlexQL *db, const char *sql, int (*callback)(void *, int, char **, char **), void *arg, char **errmsg)
 {
     if (!db || !sql)
@@ -136,13 +118,12 @@ int flexql_exec(FlexQL *db, const char *sql, int (*callback)(void *, int, char *
     int col_count = 0;
     bool aborted = false;
     char **col_names = nullptr;
-
     while (true)
     {
         MessageHeader rhdr;
         if (!Net_Receive_All(db->serverfd, &rhdr, sizeof(rhdr)))
         {
-            freeC(col_names, col_count);
+            Free_C(col_names, col_count);
             if (errmsg)
                 *errmsg = strdup("ERROR: Connection lost");
             
@@ -153,7 +134,7 @@ int flexql_exec(FlexQL *db, const char *sql, int (*callback)(void *, int, char *
         if (rhdr.length > 0 &&
             !Net_Receive_All(db->serverfd, payload.data(), rhdr.length))
         {
-            freeC(col_names, col_count);
+            Free_C(col_names, col_count);
             if (errmsg)
                 *errmsg = strdup("ERROR: Truncated message");
             
@@ -162,24 +143,24 @@ int flexql_exec(FlexQL *db, const char *sql, int (*callback)(void *, int, char *
 
         if (rhdr.type == MSG_ROW_HEADER)
         {
-            freeC(col_names, col_count);
-            col_names = unpackToC(payload, &col_count);
+            Free_C(col_names, col_count);
+            col_names = Unpack_To_C(payload, &col_count);
         }
         else if (rhdr.type == MSG_ROW)
         {
             if (!aborted && callback)
             {
                 int val_count = 0;
-                char **values = unpackToC(payload, &val_count);
+                char **values = Unpack_To_C(payload, &val_count);
                 int ret = callback(arg, col_count, values, col_names);
-                freeC(values, val_count);
+                Free_C(values, val_count);
                 if (ret != 0)
                     aborted = true;
             }
         }
         else if (rhdr.type == MSG_STATUS)
         {
-            freeC(col_names, col_count);
+            Free_C(col_names, col_count);
             if (payload.rfind("ERROR", 0) == 0)
             {
                 if (errmsg)
@@ -192,7 +173,7 @@ int flexql_exec(FlexQL *db, const char *sql, int (*callback)(void *, int, char *
         }
         else
         {
-            freeC(col_names, col_count);
+            Free_C(col_names, col_count);
             if (errmsg)
                 *errmsg = strdup("ERROR: Unknown message type");
             

@@ -1,6 +1,7 @@
 #include <vector>
 #include <cstdio>
 #include <string>
+#include <iomanip>
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
@@ -111,11 +112,9 @@ static string readSQL(const string &db_prompt)
 
 int main(int argc, char *argv[])
 {
-    const char *host = (argc > 1) ? argv[1] : "127.0.0.1";
     int port = (argc > 2) ? stoi(argv[2]) : 3000;
-
-    printf("\nFlexQL Client  —  connecting to %s:%d ...\n", host, port);
-
+    const char *host = (argc > 1) ? argv[1] : "127.0.0.1";
+    
     FlexQL *db = nullptr;
     if (flexql_open(host, port, &db) != FLEXQL_OK)
     {
@@ -123,12 +122,16 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    printf("Connected to FlexQL server.\n");
-    printf("Type SQL ending with ';'  |  .help  |  .exit\n");
-    printf("\nQuick start:\n");
-    printf("  SHOW DATABASES;           -- list existing databases\n");
-    printf("  CREATE DATABASE mydb;     -- create a new database\n");
-    printf("  USE mydb;                 -- select it before any table operations\n\n");
+    cout << "\nFlexQL Client - connected to " << host << ":" << port << endl;
+    cout << "+-------------------------------------------------------------------------+\n";
+    cout << "| Connected to FlexQL server.                                             |\n";
+    cout << "| Type SQL ending with ';' | .help | .exit                                |\n";
+    cout << "|                                                                         |\n";
+    cout << "| Quick start:                                                            |\n";
+    cout << "|   SHOW DATABASES;              -- list existing databases               |\n";
+    cout << "|   CREATE DATABASE Demo_DB;     -- create a new database                 |\n";
+    cout << "|   USE Demo_DB;                 -- select it before any table operations |\n";
+    cout << "+-------------------------------------------------------------------------+\n\n";
 
     string current_db = "none";
     while (true)

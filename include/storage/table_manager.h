@@ -15,19 +15,22 @@ public:
     mutex table_mutex;
     TableSchema schema;
 
-    TableManager(const string &dir, const string &table_name, const TableSchema &sc, bool create_new);
     ~TableManager();
+    TableManager(const string &dir, const string &table_name, const TableSchema &sc, bool create_new);
 
     void Delete_All();
     void Flush_Table();
     uint32_t New_Page();
-    uint32_t Row_Count() const;
-    uint32_t Page_Count() const;
     Page &Fetch_Page(uint32_t page_id);
     void Scan(function<bool(const Row &)> cb);
     bool Find_By_FK(int32_t key, Row &out_row);
+    vector<Row> Find_By_Range(int32_t lo, bool lo_inc, int32_t hi, bool hi_inc);
     pair<uint32_t, int> Insert_Row(const Row &row);
     int Delete_Where(function<bool(const Row &)> pred);
+    void Rebuild_Index();
+
+    uint32_t Page_Count() const { return number_of_pages; };
+    uint32_t Row_Count() const { return (uint32_t)btree.Get_Size(); };
 
 private:
     static constexpr int CACHE_CAPACITY = 4096; // 4096 × 16KB = 64 MB

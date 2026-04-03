@@ -69,6 +69,7 @@ typedef struct ParsedQuery
     OrderBy order;
     JoinClause join;
     WhereClause where;
+    vector<WhereClause> where_list;
 
     string from_table;
     vector<ColumnReference> selected_columns;
@@ -104,6 +105,5 @@ private:
     ParsedQuery Parse_Show();
     ParsedQuery Parse_Use();
 
-    // Map token type → normalised type string
     static string Token_To_TypeName(TT t);
 };

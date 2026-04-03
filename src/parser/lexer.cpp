@@ -52,6 +52,7 @@ Token Lexer::Read_Word()
         {"BY", TT::BY},
         {"ASC", TT::ASC},
         {"DESC", TT::DESC},
+        {"AND", TT::AND},
         {"IF", TT::IF},
         {"EXISTS", TT::EXISTS},
         {"INT", TT::TINT},
@@ -183,6 +184,7 @@ vector<Token> Lexer::Tokenize()
         Skip_White_Space();
         if (position >= source.size())
             break;
+        
         char c = source[position];
         if (isalpha(c) || c == '_')
             out.push_back(Read_Word());

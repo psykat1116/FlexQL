@@ -14,39 +14,29 @@ Field Make_Field(const string &val, const ColSchema &col)
 
     switch (col.type)
     {
-    case ColType::INT:
-        f.integer_value = stoi(val);
-        f.double_value = (double)f.integer_value;
-        break;
-    case ColType::DECIMAL:
-        f.double_value = stod(val);
-        f.integer_value = (int32_t)f.integer_value;
-        break;
-    case ColType::VARCHAR:
-        f.string_value = val;
-        break;
-    case ColType::BOOLEAN:
-        if (val == "1" || val == "true" || val == "TRUE" || val == "yes" || val == "YES")
-            f.boolean_value = true;
-        else
-            f.boolean_value = false;
+        case ColType::INT:
+            f.integer_value = stoi(val);
+            f.double_value = (double)f.integer_value;
+            break;
+        case ColType::DECIMAL:
+            f.double_value = stod(val);
+            f.integer_value = (int32_t)f.double_value;
+            break;
+        case ColType::VARCHAR:
+            f.string_value = val;
+            break;
+        case ColType::BOOLEAN:
+            if (val == "1" || val == "true" || val == "TRUE" || val == "yes" || val == "YES")
+                f.boolean_value = true;
+            else
+                f.boolean_value = false;
 
-        f.integer_value = f.boolean_value ? 1 : 0;
-        break;
+            f.integer_value = f.boolean_value ? 1 : 0;
+            break;
     }
 
     return f;
 }
-
-// ── Binary row layout ─────────────────────────────────────────
-// [expiry_ts   : uint64_t              8 bytes]
-// [col_offsets : uint16_t * (ncols+1)        ]  last = total size sentinel
-// [col 0 data  ...]
-// [col 1 data  ...]
-//   INT/DECIMAL → 8 bytes (double for uniformity)
-//   VARCHAR     → 2-byte length + chars
-//   BOOLEAN     → 1 byte (0 or 1)
-//   NULL        → 1 sentinel byte (0xFF)
 
 vector<uint8_t> Serialize_Row(const Row &row, const TableSchema &sc)
 {

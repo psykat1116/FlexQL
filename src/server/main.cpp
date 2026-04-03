@@ -1,7 +1,9 @@
 #include <thread>
 #include <atomic>
 #include <string>
+#include <chrono>
 #include <csignal>
+#include <iomanip>
 #include <iostream>
 #include <stdexcept>
 
@@ -20,6 +22,7 @@
 #include "common/flexql_protocol.h"
 
 using namespace std;
+using namespace chrono;
 
 static atomic<bool> global_stop = false;
 static DatabaseManager *global_manager = nullptr;
@@ -37,17 +40,14 @@ static void onSignal(int)
 
 static void handleClient(int cfd, DatabaseManager &manager)
 {
-    // Disable Nagle — each request/response is already large; we want
-    // latency, not batching at the TCP layer.
     int flag = 1;
     ::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-    // 1 MB send/receive buffers to reduce syscall count for large payloads
+
     int bufsize = 1 << 20;
     ::setsockopt(cfd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
     ::setsockopt(cfd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
 
     Database *current_db = nullptr;
-
     while (true)
     {
         MessageHeader hdr;
@@ -62,7 +62,7 @@ static void handleClient(int cfd, DatabaseManager &manager)
 
         string status;
         bool header_sent = false;
-
+        auto t_start = steady_clock::now();
         try
         {
             Lexer lx(sql);
@@ -146,6 +146,11 @@ static void handleClient(int cfd, DatabaseManager &manager)
             status = string("ERROR: ") + e.what();
         }
 
+        auto t_end = steady_clock::now();
+        double elapsed = duration<double>(t_end - t_start).count();
+        if (status.rfind("OK", 0) == 0)
+            status += " (" + to_string(elapsed).substr(0, to_string(elapsed).find('.') + 4) + "s)";
+
         Net_Send_Message(cfd, MSG_STATUS, status);
     }
 
@@ -155,7 +160,7 @@ static void handleClient(int cfd, DatabaseManager &manager)
 int main(int argc, char *argv[])
 {
     int port = (argc > 1) ? stoi(argv[1]) : 3000;
-    string data_dir = (argc > 2) ? argv[2] : "./data";
+    string data_dir = (argc > 2) ? argv[2] : "./database";
 
     mkdir(data_dir.c_str(), 0755);
 
@@ -186,13 +191,12 @@ int main(int argc, char *argv[])
         cerr << "[server] bind() failed on port " << port << "\n";
         return 1;
     }
-    ::listen(sfd, 128); // deeper backlog for burst connections
+    ::listen(sfd, 128);
 
-    cout << "================================================\n";
-    cout << "  FlexQL Server  —  port " << port << "\n";
-    cout << "  Data directory: " << data_dir << "\n";
-    cout << "  Multithreaded  |  Ctrl+C to stop.\n";
-    cout << "================================================\n\n";
+    cout << "\n+------------------------------------------+\n";
+    cout << "|  FlexQL Server - PORT " << left << setw(19) << port << "|\n";
+    cout << "|  Multithreaded  |  Ctrl + C to stop.     |\n";
+    cout << "+------------------------------------------+\n\n";
 
     while (!global_stop)
     {

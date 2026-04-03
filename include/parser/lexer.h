@@ -33,6 +33,7 @@ enum class TT
     BY,
     ASC,
     DESC,
+    AND,
     IF,
     EXISTS,
     TINT,
