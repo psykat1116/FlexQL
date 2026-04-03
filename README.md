@@ -1,4 +1,5 @@
 # FlexQL
+**Github Repository:** [https://github.com/psykat1116/FlexQL](https://github.com/psykat1116/FlexQL)
 A custom multithreaded relational database engine written in C++17, featuring a client-server architecture over TCP, a custom binary wire protocol, slotted-page storage, LRU page cache, B+ Tree primary-key indexing, and row-level TTL expiration.
 
 ---
@@ -13,10 +14,7 @@ A custom multithreaded relational database engine written in C++17, featuring a 
 ---
 
 ## Building
-
-### Server
-Compile all server-side translation units together:
-
+Compile all server-side and client side translation units together:
 ```bash
 make
 ```
