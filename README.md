@@ -1,6 +1,6 @@
 # FlexQL
 **Github Repository:** [https://github.com/psykat1116/FlexQL](https://github.com/psykat1116/FlexQL)
-A custom multithreaded relational database engine written in C++17, featuring a client-server architecture over TCP, a custom binary wire protocol, slotted-page storage, LRU page cache, B+ Tree primary-key indexing, and row-level TTL expiration.
+A custom multithreaded relational database engine written in C++17, featuring a client-server architecture over TCP, a custom binary wire protocol, a pre-allocated thread pool for connection handling, slotted-page storage, LRU page cache, B+ Tree primary-key indexing, and row-level TTL expiration.
 
 ---
 
@@ -24,15 +24,20 @@ make
 ## Running
 ### Start the server
 ```bash
-./bin/flexql_server [port] [data directory]
+./bin/flexql-server [port] [data directory]
 ```
 
 On startup you will see:
 
-```bash
-  FlexQL Server - PORT 3000
-  Multithreaded | Ctrl+C to stop.
 ```
++------------------------------------------+
+|  FlexQL Server - PORT 3000               |
+|  Thread pool: 8 worker(s)                |
+|  Ctrl + C to stop.                       |
++------------------------------------------+
+```
+
+The thread count is `max(hardware_concurrency, 4)` and is shown at startup.
 
 Press **Ctrl+C** to initiate a graceful shutdown. All dirty cache pages are flushed to disk before exit.
 
@@ -60,8 +65,22 @@ Type `.exit` or `.quit` to close the REPL session.
 ### Run benchmark
 
 ```bash
-./bin/flexql_benchmark
+make benchmark
+./bin/flexql-benchmark             # 10 M row insertion + unit tests
+./bin/flexql-benchmark 500000      # custom row count
+./bin/flexql-benchmark --unit-test # correctness tests only
 ```
+
+### Run concurrency test
+
+Verifies the thread pool handles concurrent connections correctly — including concurrent `CREATE DATABASE`, isolated parallel writes, concurrent reads, and mixed read/write workloads.
+
+```bash
+bash tests/concurrency_test.sh        # 8 concurrent clients (default)
+bash tests/concurrency_test.sh 16     # custom client count
+```
+
+The script builds the project, starts a server on port 3099, runs four test scenarios, reports pass/fail per scenario, and cleans up automatically.
 
 ---
 
@@ -111,19 +130,20 @@ Each `.tbl` file is a flat sequence of 16 KB pages. The server loads this data l
 ---
 
 ## Configuration summary
-| Parameter        | Default     | How to change                        |
-|------------------|-------------|--------------------------------------|
-| Port             | `3000`      | First argument to `flexql_server`    |
-| Data directory   | `./data`    | Second argument to `flexql_server`   |
-| Page size        | `16384` B   | Compile-time constant in `types.h`   |
-| LRU cache size   | `4096` pages| Compile-time constant in `lru_cache.h`|
-| Max columns      | `32`        | `MAX_COLS` in `types.h`              |
-| Max name length  | `64` chars  | `MAX_NAME` in `types.h`              |
+| Parameter        | Default                        | How to change                          |
+|------------------|--------------------------------|----------------------------------------|
+| Port             | `3000`                         | First argument to `flexql-server`      |
+| Data directory   | `./database`                   | Second argument to `flexql-server`     |
+| Thread pool size | `max(hardware_concurrency, 4)` | Edit `main.cpp:num_threads`            |
+| Page size        | `16384` B                      | Compile-time constant in `types.h`     |
+| LRU cache size   | `4096` pages                   | Compile-time constant in `lru_cache.h` |
+| Max columns      | `32`                           | `MAX_COLS` in `types.h`               |
+| Max name length  | `64` chars                     | `MAX_NAME` in `types.h`               |
 
 ---
 
 ## Troubleshooting
-**`bind() failed on port 3000`** — the port is already in use. Either stop the existing process or start the server on a different port: `./flexql_server 3001`.
+**`bind() failed on port 3000`** — the port is already in use. Either stop the existing process or start the server on a different port: `./bin/flexql-server 3001`.
 
 **`Connection failed` in REPL or client** — make sure the server is running before launching the client. Check that firewall rules allow the chosen port.
 

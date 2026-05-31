@@ -10,6 +10,7 @@ SRCS_PARSER  := src/parser/lexer.cpp          \
                 src/parser/parser.cpp
 SRCS_QUERY   := src/query/executor.cpp
 SRCS_NETWORK := src/network/net_utils.cpp
+SRCS_WORKER  := src/worker/worker.cpp
 
 SRCS_SHARED  := $(SRCS_STORAGE)  \
                 $(SRCS_CACHE)    \
@@ -22,6 +23,7 @@ obj = $(patsubst src/%.cpp, build/%.o, $(1))
 tobj = $(patsubst tests/%.cpp, build/tests/%.o, $(1))
 
 OBJS_SHARED    := $(call obj,$(SRCS_SHARED))
+OBJS_WORKER    := $(call obj,$(SRCS_WORKER))
 OBJS_SERVER    := $(call obj,src/server/main.cpp)
 OBJS_CLIENT    := $(call obj,src/client/flexql_client.cpp) \
                   $(call obj,src/client/repl.cpp)
@@ -39,7 +41,7 @@ all: bin/flexql-server bin/flexql-client
 	@echo "Run tests:     make test"
 	@echo "Benchmark:     make benchmark && ./bin/flexql-benchmark"
 
-bin/flexql-server: $(OBJS_SHARED) $(OBJS_SERVER)
+bin/flexql-server: $(OBJS_SHARED) $(OBJS_WORKER) $(OBJS_SERVER)
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) -o $@ $^
 	@echo "Linked: $@"

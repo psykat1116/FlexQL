@@ -21,12 +21,18 @@ FlexQL is a custom, multithreaded relational database management system (RDBMS) 
 │  └────┬─────┘    │  │         Database              │      │    │
 │       │          │  │  ┌──────────┐  ┌──────────┐   │      │    │
 │  ┌────▼─────┐    │  │  │ Table-1  │  │ Table-2  │   │      │    │
-│  │ detach   │    │  │  └──────────┘  └──────────┘   │      │    │
-│  │ thread   │    │  └───────────────────────────────┘      │    │
-│  └────┬─────┘    └─────────────────────────────────────────┘    │
-│       │                                                         │
+│  │enqueue() │    │  │  └──────────┘  └──────────┘   │      │    │
+│  └────┬─────┘    │  └───────────────────────────────┘      │    │
+│       │          └─────────────────────────────────────────┘    │
 │  ┌────▼────────────────────────────────────────────────────┐    │
-│  │                  Client Handler Thread                  │    │
+│  │              ThreadPool  (N worker threads)             │    │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐   │    │
+│  │  │ worker 0 │ │ worker 1 │ │ worker 2 │ │ worker N │   │    │
+│  │  └──────────┘ └──────────┘ └──────────┘ └──────────┘   │    │
+│  └─────────────────────────┬───────────────────────────────┘    │
+│                             │                                   │
+│  ┌──────────────────────────▼──────────────────────────────┐    │
+│  │                  Client Handler                         │    │
 │  │  TCP recv → Lexer → Parser → Executor → TCP send        │    │
 │  └─────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────┘
@@ -271,41 +277,76 @@ This design avoids write amplification — expired rows are not deleted on the f
 
 ## 7. Multithreading Design
 
-### 7.1 Thread-per-Client Model
-The server spawns one `std::thread` per accepted TCP connection and immediately detaches it. Each thread owns its own query pipeline (lexer → parser → executor) and its own TCP file descriptor. There is no thread pool; threads terminate when the client closes the connection.
+### 7.1 Thread Pool Model
+The server pre-creates a fixed pool of `N = max(hardware_concurrency, 4)` worker threads at startup. The main thread runs the `accept()` loop and pushes each accepted file descriptor into the pool's task queue via `enqueue()`. A sleeping worker wakes, pops the fd, and runs `handleClient()` for the lifetime of that connection — then loops back to wait for the next task.
 
 ```bash
 main thread:
-  listen() → accept() → detach(thread(handleClient, cfd)) → accept() …
+  listen()
+  ThreadPool pool(N)              ← N workers pre-created, blocking on condvar
+  loop:
+    cfd = accept()
+    pool.enqueue([cfd]{ handleClient(cfd, mgr); })
 
-each client thread:
+each worker thread (steady loop):
+  wait on condition_variable
+  pop fd from queue
   while (true):
     recv MSG_QUERY
     t_start = steady_clock::now()
     Lexer → Parser → Executor → send rows
     send MSG_STATUS with elapsed time
+  close(fd)
+  ← back to waiting
 ```
+
+**Why a pool instead of `detach()`:**
+- Thread creation (~100 µs) is paid once at startup, not per connection.
+- The pool provides natural back-pressure: if all workers are busy, new fds wait in the queue rather than spawning unbounded threads that could exhaust system resources.
+- Clean shutdown: the `ThreadPool` destructor sets `stop = true`, `notify_all()`, and `join()`s every worker — no dangling threads at `Ctrl+C`.
 
 ### 7.2 Locking Hierarchy
 
-Shared state is protected at two levels:
+Shared state is protected at three levels. The lock ordering is always top-to-bottom — `database_mutex` before `tables_mutex` before `table_mutex` — which prevents deadlocks.
+
 ```bash
 DatabaseManager::database_mutex   (std::mutex)
-  └── protects the databases map (create / lookup)
+  └── held for the entire body of Create_Database, List_Databases,
+      and the two critical sections inside Get_Database (double-checked
+      locking pattern: lookup → stat → re-lock → insert)
 
 Database::tables_mutex            (std::shared_mutex)
-  ├── shared_lock   → reading schema / looking up table pointer
-  └── unique_lock   → adding a new table (CREATE TABLE)
+  ├── shared_lock  → Table_Names, schema lookup, Get_Table fast path
+  └── unique_lock  → Get_Table lazy-load, Execute_Create insertion
 
 TableManager::table_mutex         (std::mutex)
-  └── exclusive lock on every INSERT, DELETE, SELECT, FLUSH
-      (one query at a time per table)
+  └── exclusive lock on every INSERT, DELETE, SELECT scan/lookup, FLUSH
+      (one query at a time per table; different tables are independent)
 ```
 
-Read-heavy metadata operations (schema lookup, table pointer fetch) acquire a `shared_lock`, allowing multiple client threads to read concurrently. Any mutation of a table acquires a `lock_guard` (exclusive), blocking other threads for the duration of that operation. This is a deliberate simplicity trade-off: no deadlock risk, no MVCC complexity, correct behaviour under concurrent load.
+**Key correctness invariants:**
+- `Create_Database` and `List_Databases` both hold `database_mutex` while touching the filesystem directory, preventing a concurrent create from racing a directory scan.
+- `Table_Names` holds `tables_mutex` as a shared lock while scanning the `.schema` directory, preventing a concurrent `CREATE TABLE` from creating a partially-visible entry.
+- `Get_Table` uses the double-checked pattern: fast path under `shared_lock`, slow path (lazy load from disk) under `unique_lock` with a re-check to prevent double-insertion.
+- Multiple clients performing concurrent `SELECT` on the same table each hold `table_mutex` exclusively but in sequence — readers do not bypass the mutex. Concurrent reads on *different* tables are fully parallel.
+- The `tables_mutex` `shared_lock` in `Flush_DB` ensures flushing can proceed concurrently with reads but blocks new table creation.
 
-### 7.3 Signal Handling
-`SIGINT` and `SIGTERM` set a global `atomic<bool> global_stop = true` and call `DatabaseManager::Flush_DB_Manager()`, which acquires each table's mutex, flushes dirty pages, and saves the B+ Tree index before `exit(0)`. `SIGPIPE` is ignored so a client disconnect does not terminate the server.
+### 7.3 ThreadPool Implementation
+
+`ThreadPool` (`include/worker/worker.h`, `src/worker/worker.cpp`) owns:
+
+| Member | Role |
+|---|---|
+| `vector<thread> workers` | Pre-created worker threads |
+| `queue<function<void()>> tasks` | Pending connection handlers |
+| `mutex queue_mutex` | Protects the task queue |
+| `condition_variable cv` | Workers sleep here when queue is empty |
+| `atomic<bool> stop` | Signals workers to drain and exit |
+
+`enqueue(fn)` locks `queue_mutex`, pushes the lambda, and calls `cv.notify_one()`. The woken worker pops the task under the same lock, releases it, then calls the lambda — so `handleClient` runs without holding the queue lock, allowing other workers to accept new tasks concurrently.
+
+### 7.4 Signal Handling
+`SIGINT` and `SIGTERM` set `global_stop = true` and call `DatabaseManager::Flush_DB_Manager()`, which acquires each table's mutex, flushes dirty pages, and saves the B+ Tree index before `exit(0)`. The `ThreadPool` destructor fires as part of stack unwinding before `exit`, joining all workers cleanly. `SIGPIPE` is ignored so a client disconnect does not terminate the server.
 
 ---
 
@@ -377,7 +418,10 @@ The parser was extended to support multiple AND-chained predicates. All conditio
 ### 9.4 Index Auto-Rebuild After Unclean Shutdown
 If the server is killed during a bulk insert (before the first `Ctrl+C` flush), the `.idx` file may not exist on the next startup. The `TableManager` constructor detects this and calls `Rebuild_Index()`, which scans the raw `.tbl` pages to reconstruct the B+ Tree entirely in memory, then immediately saves it. This means the first query after a crash may be slower (O(N pages) rebuild), but all subsequent queries use the index normally.
 
-### 9.5 Execution Time Reporting
+### 9.5 Thread Pool Sizing
+The pool size defaults to `max(std::thread::hardware_concurrency(), 4)`. The minimum of 4 guards against environments that report 0 or 1 logical CPUs. Since `handleClient` is I/O-bound (network reads, disk reads through the page cache), it spends most of its time blocked in `pread`/`pwrite`/`recv`/`send` — all of which release the CPU. A pool of `hardware_concurrency` threads is therefore sufficient to keep all cores busy without the overhead of fine-grained I/O concurrency primitives. The value can be adjusted at `main.cpp:num_threads` without any other changes.
+
+### 9.6 Execution Time Reporting
 `std::chrono::steady_clock` is started immediately before the query pipeline in `main.cpp` and stopped after execution. The elapsed duration in seconds (formatted to 3 decimal places) is appended to every `OK` status message. This makes performance visible directly in the REPL without external tooling.
 
 ---
@@ -386,6 +430,7 @@ If the server is killed during a bulk insert (before the first `Ctrl+C` flush), 
 
 ```bash
 main.cpp
+ ├── worker.h / worker.cpp        (ThreadPool: queue, condvar, N workers)
  ├── lexer.h / lexer.cpp          (tokenization, incl. AND keyword)
  ├── parser.h / parser.cpp        (AST, where_list for AND chains)
  ├── executor.h / executor.cpp    (query routing: point/range/scan)
@@ -400,4 +445,7 @@ main.cpp
 
 flexql_client.cpp                 (C driver: flexql_open/exec/close)
  └── flexql.h                     (public C API)
+
+tests/concurrency_test.sh         (bash concurrency harness, 4 scenarios)
+ └── uses flexql-server + flexql-client binaries over TCP
 ```

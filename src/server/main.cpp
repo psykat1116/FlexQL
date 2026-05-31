@@ -17,6 +17,7 @@
 
 #include "parser/lexer.h"
 #include "parser/parser.h"
+#include "worker/worker.h"
 #include "query/executor.h"
 #include "network/net_utils.h"
 #include "common/flexql_protocol.h"
@@ -193,9 +194,13 @@ int main(int argc, char *argv[])
     }
     ::listen(sfd, 128);
 
+    size_t num_threads = max(thread::hardware_concurrency(), 4u);
+    ThreadPool pool(num_threads);
+
     cout << "\n+------------------------------------------+\n";
     cout << "|  FlexQL Server - PORT " << left << setw(19) << port << "|\n";
-    cout << "|  Multithreaded  |  Ctrl + C to stop.     |\n";
+    cout << "|  Thread pool: " << setw(26) << (to_string(num_threads) + " worker(s)") << "|\n";
+    cout << "|  Ctrl + C to stop.                      |\n";
     cout << "+------------------------------------------+\n\n";
 
     while (!global_stop)
@@ -215,9 +220,7 @@ int main(int argc, char *argv[])
         inet_ntop(AF_INET, &ca.sin_addr, ip, sizeof(ip));
         cout << "[server] Client " << ip << ":" << ntohs(ca.sin_port) << "  (fd = " << cfd << ")\n";
 
-        thread([cfd, &mgr]()
-               { handleClient(cfd, mgr); })
-            .detach();
+        pool.enqueue([cfd, &mgr]() { handleClient(cfd, mgr); });
     }
 
     ::close(sfd);

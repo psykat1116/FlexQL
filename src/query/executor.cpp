@@ -165,6 +165,7 @@ TableManager *Database::Get_Table(const string &name)
 
 vector<string> Database::Table_Names()
 {
+    shared_lock lk(tables_mutex);
     vector<string> names;
     DIR *d = opendir(database_directory.c_str());
     if (!d)
@@ -627,6 +628,7 @@ DatabaseManager::DatabaseManager(const string &root_dir) : root_directory(root_d
 
 string DatabaseManager::Create_Database(const string &name)
 {
+    lock_guard lk(database_mutex);
     struct stat st;
     string path = root_directory + "/" + name;
     if (stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
@@ -638,6 +640,7 @@ string DatabaseManager::Create_Database(const string &name)
 
 vector<string> DatabaseManager::List_Databases()
 {
+    lock_guard lk(database_mutex);
     vector<string> names;
     DIR *d = opendir(root_directory.c_str());
     if (!d)

@@ -6,7 +6,10 @@
 #include "common/flexql.h"
 
 using namespace std;
-using namespace chrono;
+using namespace std::chrono;
+
+static const int INSERT_BATCH_SIZE = 10000; // if you implement batch inserts in flexql, you can increase this for better performance
+static const long long DEFAULT_INSERT_ROWS = 100000LL; // 100k rows by default for insertion benchmark
 
 struct FlexQLError
 {
@@ -21,88 +24,105 @@ struct FlexQLError
     }
 };
 
-static constexpr int INSERT_BATCH_SIZE = 10000;
-static constexpr long long DEFAULT_INSERT_ROWS = 10000000LL;
-
-static int Row_Counter_Callback(void *data, int /*argc*/, char ** /*argv*/, char ** /*azColName*/)
+static int count_rows_callback(void *data, int argc, char **argv, char **azColName)
 {
-    if (auto *stats = static_cast<QueryStats *>(data))
+    (void)argc;
+    (void)argv;
+    (void)azColName;
+    QueryStats *stats = static_cast<QueryStats *>(data);
+    if (stats)
+    {
         stats->rows++;
-
+    }
     return 0;
 }
 
-static bool Run_Execution(FlexQL *db, const string &sql, const string &label)
+static bool run_exec(FlexQL *db, const string &sql, const string &label)
 {
-    FlexQLError err;
-
+    char *errMsg = nullptr;
     auto start = high_resolution_clock::now();
-    int rc = flexql_exec(db, sql.c_str(), nullptr, nullptr, err.ptr());
+    int rc = flexql_exec(db, sql.c_str(), nullptr, nullptr, &errMsg);
     auto end = high_resolution_clock::now();
+    long long elapsed = duration_cast<milliseconds>(end - start).count();
 
     if (rc != FLEXQL_OK)
     {
-        cout << "[FAIL] " << label << " -> " << err.get() << "\n";
+        cout << "[FAIL] " << label << " -> " << (errMsg ? errMsg : "unknown error") << "\n";
+        if (errMsg)
+        {
+            flexql_free(errMsg);
+        }
         return false;
     }
 
-    auto elapsed = duration_cast<milliseconds>(end - start).count();
     cout << "[PASS] " << label << " (" << elapsed << " ms)\n";
-
     return true;
 }
 
-static bool Run_Query(FlexQL *db, const string &sql, const string &label)
+static bool run_query(FlexQL *db, const string &sql, const string &label)
 {
-    FlexQLError err;
     QueryStats stats;
-
+    char *errMsg = nullptr;
     auto start = high_resolution_clock::now();
-    int rc = flexql_exec(db, sql.c_str(), Row_Counter_Callback, &stats, err.ptr());
+    int rc = flexql_exec(db, sql.c_str(), count_rows_callback, &stats, &errMsg);
     auto end = high_resolution_clock::now();
+    long long elapsed = duration_cast<milliseconds>(end - start).count();
 
     if (rc != FLEXQL_OK)
     {
-        cout << "[FAIL] " << label << " -> " << err.get() << "\n";
+        cout << "[FAIL] " << label << " -> " << (errMsg ? errMsg : "unknown error") << "\n";
+        if (errMsg)
+        {
+            flexql_free(errMsg);
+        }
         return false;
     }
 
-    auto elapsed = duration_cast<milliseconds>(end - start).count();
     cout << "[PASS] " << label << " | rows=" << stats.rows << " | " << elapsed << " ms\n";
-
     return true;
 }
 
-static bool Query_Rows(FlexQL *db, const string &sql, vector<string> &out_rows)
+static bool query_rows(FlexQL *db, const string &sql, vector<string> &out_rows)
 {
-    out_rows.clear();
-    auto cb = [](void *data, int argc, char **argv, char ** /*azColName*/) -> int
+    struct Collector
     {
-        auto *rows = static_cast<vector<string> *>(data);
+        vector<string> rows;
+    } collector;
+
+    auto cb = [](void *data, int argc, char **argv, char **azColName) -> int
+    {
+        (void)azColName;
+        Collector *c = static_cast<Collector *>(data);
         string row;
         for (int i = 0; i < argc; ++i)
         {
             if (i > 0)
+            {
                 row += "|";
+            }
             row += (argv[i] ? argv[i] : "NULL");
         }
-
-        rows->push_back(move(row));
+        c->rows.push_back(row);
         return 0;
     };
 
-    FlexQLError err;
-    int rc = flexql_exec(db, sql.c_str(), cb, &out_rows, err.ptr());
+    char *errMsg = nullptr;
+    int rc = flexql_exec(db, sql.c_str(), cb, &collector, &errMsg);
     if (rc != FLEXQL_OK)
     {
-        cout << "[FAIL] " << sql << " -> " << err.get() << "\n";
+        cout << "[FAIL] " << sql << " -> " << (errMsg ? errMsg : "unknown error") << "\n";
+        if (errMsg)
+        {
+            flexql_free(errMsg);
+        }
         return false;
     }
 
+    out_rows = collector.rows;
     return true;
 }
 
-static bool Assert_Rows_Equal(const string &label, const vector<string> &actual, const vector<string> &expected)
+static bool assert_rows_equal(const string &label, const vector<string> &actual, const vector<string> &expected)
 {
     if (actual == expected)
     {
@@ -113,30 +133,35 @@ static bool Assert_Rows_Equal(const string &label, const vector<string> &actual,
     cout << "[FAIL] " << label << "\n";
     cout << "Expected (" << expected.size() << "):\n";
     for (const auto &r : expected)
+    {
         cout << "  " << r << "\n";
-
+    }
     cout << "Actual (" << actual.size() << "):\n";
     for (const auto &r : actual)
+    {
         cout << "  " << r << "\n";
-
+    }
     return false;
 }
 
-static bool Expect_Query_Failure(FlexQL *db, const string &sql, const string &label)
+static bool expect_query_failure(FlexQL *db, const string &sql, const string &label)
 {
-    FlexQLError err;
-    int rc = flexql_exec(db, sql.c_str(), nullptr, nullptr, err.ptr());
+    char *errMsg = nullptr;
+    int rc = flexql_exec(db, sql.c_str(), nullptr, nullptr, &errMsg);
     if (rc == FLEXQL_OK)
     {
         cout << "[FAIL] " << label << " (expected failure, got success)\n";
         return false;
     }
-
+    if (errMsg)
+    {
+        flexql_free(errMsg);
+    }
     cout << "[PASS] " << label << "\n";
     return true;
 }
 
-static bool Assert_Row_Count(const string &label, const vector<string> &rows, size_t expected_count)
+static bool assert_row_count(const string &label, const vector<string> &rows, size_t expected_count)
 {
     if (rows.size() == expected_count)
     {
@@ -148,118 +173,146 @@ static bool Assert_Row_Count(const string &label, const vector<string> &rows, si
     return false;
 }
 
-static bool Run_Unit_Test(FlexQL *db)
+static bool run_data_level_unit_tests(FlexQL *db)
 {
     cout << "\n[[...Running Unit Tests...]]\n\n";
 
     bool all_ok = true;
     int total_tests = 0;
     int failed_tests = 0;
+    int total_weight = 0;
+    int earned_weight = 0;
 
-    auto record = [&](bool result)
+    auto record = [&](bool result, int weight)
     {
         total_tests++;
+        total_weight += weight;
         if (!result)
         {
             all_ok = false;
             failed_tests++;
         }
+        else
+        {
+            earned_weight += weight;
+        }
     };
 
-    record(Run_Execution(db, "CREATE TABLE test_users(id DECIMAL, name VARCHAR(64), balance DECIMAL, expires_at DECIMAL);", "CREATE TABLE test_users"));
+    record(run_exec(
+               db,
+               "CREATE TABLE TEST_USERS(ID DECIMAL, NAME VARCHAR(64), BALANCE DECIMAL, EXPIRES_AT DECIMAL);",
+               "CREATE TABLE TEST_USERS"),
+           1);
+
     auto insert_test_user = [&](long long id, const string &name, long long balance, long long expires_at) -> bool
     {
         stringstream ss;
-        ss << "INSERT INTO test_users VALUES ("
+        ss << "INSERT INTO TEST_USERS VALUES ("
            << id << ", '" << name << "', " << balance << ", " << expires_at << ");";
-        return Run_Execution(db, ss.str(), "INSERT test_users id=" + to_string(id));
+        return run_exec(db, ss.str(), "INSERT TEST_USERS ID=" + to_string(id));
     };
 
-    record(insert_test_user(1, "Alice", 1200, 1893456000));
-    record(insert_test_user(2, "Bob", 450, 1893456000));
-    record(insert_test_user(3, "Carol", 2200, 1893456000));
-    record(insert_test_user(4, "Dave", 800, 1893456000));
+    record(insert_test_user(1, "Eve", 300, 1893456000), 1);
+    record(insert_test_user(2, "Frank", 1800, 1893456000), 1);
+    record(insert_test_user(3, "Grace", 950, 1893456000), 1);
+    record(insert_test_user(4, "Henry", 3500, 1893456000), 1);
+    record(insert_test_user(5, "Iris", 600, 1893456000), 1);
 
     vector<string> rows;
 
-    bool q0 = Query_Rows(db, "SELECT * FROM test_users;", rows);
-    record(q0);
-    if (q0)
-    {
-        record(Assert_Rows_Equal("Basic SELECT * validation", rows, {"1|Alice|1200|1893456000", "2|Bob|450|1893456000", "3|Carol|2200|1893456000", "4|Dave|800|1893456000"}));
-    }
+    query_rows(db, "SELECT * FROM TEST_USERS;", rows);
+    record(assert_rows_equal("Basic SELECT * validation", rows, {"1|Eve|300|1893456000", "2|Frank|1800|1893456000", "3|Grace|950|1893456000", "4|Henry|3500|1893456000", "5|Iris|600|1893456000"}), 1);
 
-    bool q1 = Query_Rows(db, "SELECT name, balance FROM test_users WHERE id = 2;", rows);
-    record(q1);
-    if (q1)
-    {
-        record(Assert_Rows_Equal("Single-row value validation", rows, {"Bob|450"}));
-    }
+    query_rows(db, "SELECT NAME, BALANCE FROM TEST_USERS WHERE ID = 1;", rows);
+    record(assert_rows_equal("Single-row value validation", rows, {"Eve|300"}), 1);
 
-    bool q2 = Query_Rows(db, "SELECT name FROM test_users WHERE balance > 1000;", rows);
-    record(q2);
-    if (q2)
-    {
-        record(Assert_Rows_Equal("Filtered rows validation", rows, {"Alice", "Carol"}));
-    }
+    query_rows(db, "SELECT NAME FROM TEST_USERS WHERE BALANCE > 1500;", rows);
+    record(assert_rows_equal("Filtered rows validation", rows, {"Frank", "Henry"}), 1);
 
-    bool q3 = Query_Rows(db, "SELECT id FROM test_users WHERE balance > 5000;", rows);
-    record(q3);
-    if (q3)
-    {
-        record(Assert_Row_Count("Empty result-set validation", rows, 0));
-    }
+    query_rows(db, "SELECT ID FROM TEST_USERS WHERE BALANCE < 100;", rows);
+    record(assert_row_count("Empty result-set validation", rows, 0), 1);
 
-    record(Run_Execution(db, "CREATE TABLE test_orders(order_id DECIMAL, user_id DECIMAL, amount DECIMAL, expires_at DECIMAL);", "CREATE TABLE test_orders"));
-    record(Run_Execution(db, "INSERT INTO test_orders VALUES (101, 1, 50, 1893456000);", "INSERT test_orders order_id=101"));
-    record(Run_Execution(db, "INSERT INTO test_orders VALUES (102, 1, 150, 1893456000);", "INSERT test_orders order_id=102"));
-    record(Run_Execution(db, "INSERT INTO test_orders VALUES (103, 3, 500, 1893456000);", "INSERT test_orders order_id=103"));
+    query_rows(db, "SELECT NAME, BALANCE FROM TEST_USERS WHERE BALANCE >= 950;", rows);
+    record(assert_rows_equal("High-balance users validation", rows, {"Frank|1800", "Grace|950", "Henry|3500"}), 2);
 
-    bool q7 = Query_Rows(
+    query_rows(db, "SELECT NAME FROM TEST_USERS WHERE BALANCE < 700;", rows);
+    record(assert_rows_equal("Low-balance users validation", rows, {"Eve", "Iris"}), 2);
+
+    record(run_exec(
+               db,
+               "CREATE TABLE TEST_ORDERS(ORDER_ID DECIMAL, USER_ID DECIMAL, AMOUNT DECIMAL, EXPIRES_AT DECIMAL);",
+               "CREATE TABLE TEST_ORDERS"),
+           1);
+
+    record(run_exec(
+               db,
+               "INSERT INTO TEST_ORDERS VALUES (201, 2, 75, 1893456000);",
+               "INSERT TEST_ORDERS ORDER_ID=201"),
+           1);
+
+    record(run_exec(
+               db,
+               "INSERT INTO TEST_ORDERS VALUES (202, 4, 300, 1893456000);",
+               "INSERT TEST_ORDERS ORDER_ID=202"),
+           1);
+
+    record(run_exec(
+               db,
+               "INSERT INTO TEST_ORDERS VALUES (203, 4, 1200, 1893456000);",
+               "INSERT TEST_ORDERS ORDER_ID=203"),
+           1);
+
+    query_rows(
         db,
-        "SELECT test_users.name, test_orders.amount "
-        "FROM test_users INNER JOIN test_orders ON test_users.id = test_orders.user_id "
-        "WHERE test_orders.amount > 900;",
+        "SELECT TEST_USERS.NAME, TEST_ORDERS.AMOUNT "
+        "FROM TEST_USERS INNER JOIN TEST_ORDERS ON TEST_USERS.ID = TEST_ORDERS.USER_ID "
+        "WHERE TEST_ORDERS.AMOUNT >= 300;",
         rows);
+    record(assert_rows_equal("Join with matching rows validation", rows, {"Henry|300", "Henry|1200"}), 4);
 
-    record(q7);
-    if (q7)
-    {
-        record(Assert_Row_Count("Join with no matches validation", rows, 0));
-    }
+    query_rows(
+        db,
+        "SELECT TEST_USERS.NAME, TEST_ORDERS.AMOUNT "
+        "FROM TEST_USERS INNER JOIN TEST_ORDERS ON TEST_USERS.ID = TEST_ORDERS.USER_ID;",
+        rows);
+    record(assert_rows_equal("Join all matched rows validation", rows, {"Frank|75", "Henry|300", "Henry|1200"}), 4);
 
-    record(Expect_Query_Failure(db, "SELECT UNKNOWN_COLUMN FROM test_users;", "Invalid SQL should fail"));
-    record(Expect_Query_Failure(db, "SELECT * FROM MISSING_TABLE;", "Missing table should fail"));
+    record(expect_query_failure(db, "SELECT GHOST_COL FROM TEST_USERS;", "Invalid column should fail"), 2);
+    record(expect_query_failure(db, "SELECT * FROM NO_SUCH_TABLE;", "Missing table should fail"), 2);
 
     int passed_tests = total_tests - failed_tests;
-    cout << "\nUnit Test Summary: " << passed_tests << "/" << total_tests << " passed, " << failed_tests << " failed.\n\n";
+    cout << "\nUnit Test Summary: " << passed_tests << "/" << total_tests << " passed, "
+         << failed_tests << " failed.\n";
+    cout << "Total Marks: " << earned_weight << "/" << total_weight << "\n\n";
 
     return all_ok;
 }
 
-static bool Run_Insert_Benchmark(FlexQL *db, long long target_rows)
+static bool run_insert_benchmark(FlexQL *db, long long target_rows)
 {
-    if (!Run_Execution(
+    if (!run_exec(
             db,
-            "CREATE TABLE users("
-            "id DECIMAL, name VARCHAR(64), "
-            "email VARCHAR(64), balance DECIMAL, expires_at DECIMAL);",
-            "CREATE TABLE users"))
+            "CREATE TABLE BIG_USERS(ID DECIMAL, NAME VARCHAR(64), EMAIL VARCHAR(64), BALANCE DECIMAL, EXPIRES_AT DECIMAL);",
+            "CREATE TABLE BIG_USERS"))
+    {
         return false;
+    }
 
     cout << "\nStarting insertion benchmark for " << target_rows << " rows...\n";
     auto bench_start = high_resolution_clock::now();
 
     long long inserted = 0;
-    long long progress_step = max(1LL, target_rows / 10);
+    long long progress_step = target_rows / 10;
+    if (progress_step <= 0)
+    {
+        progress_step = 1;
+    }
     long long next_progress = progress_step;
 
-    stringstream ss;
     while (inserted < target_rows)
     {
-        ss.str("");
-        ss.clear();
-        ss << "INSERT INTO users VALUES ";
+        stringstream ss;
+        ss << "INSERT INTO BIG_USERS VALUES ";
 
         int in_batch = 0;
         while (in_batch < INSERT_BATCH_SIZE && inserted < target_rows)
@@ -270,7 +323,6 @@ static bool Run_Insert_Benchmark(FlexQL *db, long long target_rows)
                << ", 'user" << id << "@mail.com'"
                << ", " << (1000.0 + (id % 10000))
                << ", 1893456000)";
-
             inserted++;
             in_batch++;
             if (in_batch < INSERT_BATCH_SIZE && inserted < target_rows)
@@ -280,10 +332,14 @@ static bool Run_Insert_Benchmark(FlexQL *db, long long target_rows)
         }
         ss << ";";
 
-        FlexQLError err;
-        if (flexql_exec(db, ss.str().c_str(), nullptr, nullptr, err.ptr()) != FLEXQL_OK)
+        char *errMsg = nullptr;
+        if (flexql_exec(db, ss.str().c_str(), nullptr, nullptr, &errMsg) != FLEXQL_OK)
         {
-            cout << "[FAIL] INSERT users batch -> " << err.get() << "\n";
+            cout << "[FAIL] INSERT BIG_USERS batch -> " << (errMsg ? errMsg : "unknown error") << "\n";
+            if (errMsg)
+            {
+                flexql_free(errMsg);
+            }
             return false;
         }
 
@@ -309,8 +365,8 @@ static bool Run_Insert_Benchmark(FlexQL *db, long long target_rows)
 int main(int argc, char **argv)
 {
     FlexQL *db = nullptr;
-    bool run_unit_tests_only = false;
     long long insert_rows = DEFAULT_INSERT_ROWS;
+    bool run_unit_tests_only = false;
 
     if (argc > 1)
     {
@@ -321,10 +377,10 @@ int main(int argc, char **argv)
         }
         else
         {
-            insert_rows = stoll(argv[1]);
+            insert_rows = atoll(argv[1]);
             if (insert_rows <= 0)
             {
-                cout << "Invalid row count. Use a positive integer.\n";
+                cout << "Invalid row count. Use a positive integer or --unit-test.\n";
                 return 1;
             }
         }
@@ -356,18 +412,20 @@ int main(int argc, char **argv)
 
     if (run_unit_tests_only)
     {
-        bool ok = Run_Unit_Test(db);
+        bool ok = run_data_level_unit_tests(db);
         flexql_close(db);
         return ok ? 0 : 1;
     }
 
-    if (!Run_Insert_Benchmark(db, insert_rows))
-    {
+    cout << "Running SQL subset checks plus insertion benchmark...\n";
+    cout << "Target insert rows: " << insert_rows << "\n\n";
+
+    if (!run_insert_benchmark(db, insert_rows)) {
         flexql_close(db);
         return 1;
     }
 
-    if (!Run_Unit_Test(db))
+    if (!run_data_level_unit_tests(db))
     {
         flexql_close(db);
         return 1;
