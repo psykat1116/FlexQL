@@ -88,8 +88,7 @@ TableManager::~TableManager()
 
 void TableManager::Flush_Table()
 {
-    cache.Flush_All([this](uint32_t pid, const Page &pg)
-                    { Write_To_Disk(pid, pg); });
+    cache.Flush_All(Write_Back());
 
     if (table_fd >= 0 && number_of_pages < allocated_pages)
     {
@@ -102,31 +101,42 @@ void TableManager::Flush_Table()
     btree.Save_Tree(index_path);
 }
 
-Page &TableManager::Fetch_Page(uint32_t page_id)
+LRUCache::FlushFn TableManager::Write_Back()
 {
-    Page *p = cache.Get_Page(page_id);
-    if (p)
-        return *p;
-
-    Page pg;
-    Read_From_Disk(page_id, pg);
-    cache.Put_Page(page_id, pg, false, [this](uint32_t pid, const Page &pp)
-                   { Write_To_Disk(pid, pp); });
-
-    return *cache.Get_Page(page_id);
+    return [this](uint32_t pid, const Page &pg)
+    { Write_To_Disk(pid, pg); };
 }
 
-uint32_t TableManager::New_Page()
+PageGuard TableManager::Fetch_Page(uint32_t page_id)
+{
+    PageGuard g = cache.Pin_Page(page_id);
+    if (g)
+        return g;
+
+    // Miss: reserve a pinned slot and read the page straight into it,
+    // avoiding a 16 KB stack temporary and a second copy into the cache.
+    g = cache.Insert_Pinned(page_id, false, Write_Back());
+    try
+    {
+        Read_From_Disk(page_id, *g);
+    }
+    catch (...)
+    {
+        g.Release();
+        cache.Discard(page_id); // don't leave a half-filled page behind
+        throw;
+    }
+    return g;
+}
+
+PageGuard TableManager::New_Page()
 {
     uint32_t pid = number_of_pages++;
     Ensure_Capacity();
 
-    Page pg;
-    pg.Initialize_Page(pid);
-    cache.Put_Page(pid, pg, true, [this](uint32_t p, const Page &pp)
-                   { Write_To_Disk(p, pp); });
-
-    return pid;
+    PageGuard g = cache.Insert_Pinned(pid, true, Write_Back());
+    g->Initialize_Page(pid);
+    return g;
 }
 
 std::pair<uint32_t, int> TableManager::Insert_Row(const Row &row)
@@ -135,23 +145,23 @@ std::pair<uint32_t, int> TableManager::Insert_Row(const Row &row)
     if (number_of_pages > 0)
     {
         uint32_t pid = number_of_pages - 1;
-        Page &pg = Fetch_Page(pid);
-        int slot = pg.Insert_Row(bytes.data(), (uint16_t)bytes.size());
+        PageGuard pg = Fetch_Page(pid);
+        int slot = pg->Insert_Row(bytes.data(), (uint16_t)bytes.size());
         if (slot >= 0)
         {
-            cache.Mark_Dirty(pid);
+            pg.Mark_Dirty();
             int pk = schema.Primary_Key_Column();
             btree.Insert_Key(row.fields[pk].integer_value, pid, (uint16_t)slot);
             return {pid, slot};
         }
     }
 
-    uint32_t pid = New_Page();
-    Page &pg = Fetch_Page(pid);
-    int slot = pg.Insert_Row(bytes.data(), (uint16_t)bytes.size());
+    PageGuard pg = New_Page();
+    uint32_t pid = pg.Page_Id();
+    int slot = pg->Insert_Row(bytes.data(), (uint16_t)bytes.size());
 
     assert(slot >= 0);
-    cache.Mark_Dirty(pid);
+    pg.Mark_Dirty();
     int pk = schema.Primary_Key_Column();
     btree.Insert_Key(row.fields[pk].integer_value, pid, (uint16_t)slot);
 
@@ -164,8 +174,8 @@ bool TableManager::Find_By_FK(int32_t key, Row &out_row)
     if (!btree.Find_Key(key, rec))
         return false;
 
-    Page &pg = Fetch_Page(rec.page_id);
-    const uint8_t *raw = pg.getRow(rec.slot_idx);
+    PageGuard pg = Fetch_Page(rec.page_id);
+    const uint8_t *raw = pg->getRow(rec.slot_idx);
     if (!raw)
         return false;
 
@@ -178,8 +188,8 @@ std::vector<Row> TableManager::Find_By_Range(int32_t lo, bool lo_inc, int32_t hi
     std::vector<Row> results;
     for (const IndexRecord &rec : btree.Find_Range(lo, lo_inc, hi, hi_inc))
     {
-        Page &pg = Fetch_Page(rec.page_id);
-        const uint8_t *raw = pg.getRow(rec.slot_idx);
+        PageGuard pg = Fetch_Page(rec.page_id);
+        const uint8_t *raw = pg->getRow(rec.slot_idx);
         if (!raw)
             continue;
         Row row = Deserialize_Row(raw, schema);
@@ -193,10 +203,12 @@ void TableManager::Scan(std::function<bool(const Row &)> cb)
 {
     for (uint32_t pid = 0; pid < number_of_pages; pid++)
     {
-        Page &pg = Fetch_Page(pid);
-        for (int s = 0; s < pg.Number_Of_Slots(); s++)
+        // The guard keeps this page pinned while cb() runs, so even if the
+        // callback fetches enough other pages to fill the cache, `pg` stays valid.
+        PageGuard pg = Fetch_Page(pid);
+        for (int s = 0; s < pg->Number_Of_Slots(); s++)
         {
-            const uint8_t *raw = pg.getRow(s);
+            const uint8_t *raw = pg->getRow(s);
             if (!raw)
                 continue;
             Row row = Deserialize_Row(raw, schema);
@@ -275,10 +287,10 @@ int TableManager::Purge_Expired()
 
     for (uint32_t pid = 0; pid < number_of_pages; pid++)
     {
-        Page &pg = Fetch_Page(pid);
-        for (int s = 0; s < pg.Number_Of_Slots(); s++)
+        PageGuard pg = Fetch_Page(pid);
+        for (int s = 0; s < pg->Number_Of_Slots(); s++)
         {
-            const uint8_t *raw = pg.getRow(s);
+            const uint8_t *raw = pg->getRow(s);
             if (!raw)
                 continue;
 

@@ -20,8 +20,8 @@ public:
 
     void Delete_All();
     void Flush_Table();
-    uint32_t New_Page();
-    Page &Fetch_Page(uint32_t page_id);
+    PageGuard New_Page();
+    PageGuard Fetch_Page(uint32_t page_id);
     void Scan(function<bool(const Row &)> cb);
     bool Find_By_FK(int32_t key, Row &out_row);
     vector<Row> Find_By_Range(int32_t lo, bool lo_inc, int32_t hi, bool hi_inc);
@@ -50,6 +50,7 @@ private:
     BPlusTree btree;
 
     void Close_FD();
+    LRUCache::FlushFn Write_Back();
     void Ensure_Capacity();
     void Open_FD(bool create);
     void Read_From_Disk(uint32_t page_id, Page &pg);
