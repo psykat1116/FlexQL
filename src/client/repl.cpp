@@ -1,14 +1,21 @@
 #include <vector>
+#include <chrono>
 #include <cstdio>
 #include <string>
 #include <iomanip>
 #include <cstring>
 #include <cstdlib>
+#include <csignal>
 #include <iostream>
 #include <algorithm>
+#include <unistd.h>
+#include <poll.h>
+#include <termios.h>
 #include "common/flexql.h"
+#include "common/term_colors.h"
 
 using namespace std;
+using namespace term;
 
 typedef struct
 {
@@ -29,35 +36,48 @@ typedef struct
 
         auto sep = [&]()
         {
-            printf("+");
+            printf("%s+", c(BLUE));
             for (size_t i = 0; i < ncols; i++)
             {
                 for (size_t j = 0; j < widths[i] + 2; j++)
                     printf("-");
                 printf("+");
             }
-            printf("\n");
+            printf("%s\n", c(RESET));
         };
-        auto printRow = [&](const vector<string> &vals)
+        auto isNumber = [](const string &s)
         {
-            printf("|");
+            if (s.empty())
+                return false;
+            char *end = nullptr;
+            strtod(s.c_str(), &end);
+            return end && *end == '\0';
+        };
+        auto printRow = [&](const vector<string> &vals, bool header)
+        {
+            const char *bar = c(BLUE), *rst = c(RESET);
+            printf("%s|%s", bar, rst);
             for (size_t i = 0; i < ncols; i++)
             {
                 string v = (i < vals.size()) ? vals[i] : "";
-                printf(" %-*s |", (int)widths[i], v.c_str());
+                const char *col = header           ? c(BCYAN)
+                                  : v == "NULL"    ? c(DIM)
+                                  : isNumber(v)    ? c(YELLOW)
+                                                   : "";
+                printf(" %s%-*s%s %s|%s", col, (int)widths[i], v.c_str(), rst, bar, rst);
             }
             printf("\n");
         };
 
         sep();
-        printRow(col_names);
+        printRow(col_names, true);
 
         sep();
         for (auto &row : rows)
-            printRow(row);
+            printRow(row, false);
 
         sep();
-        printf("  %zu row(s) in set.\n\n", rows.size());
+        printf(" %s%zu row(s) in set.%s\n\n", c(DIM), rows.size(), c(RESET));
     }
 } TablePrinter;
 
@@ -85,53 +105,226 @@ static int collectRow(void *arg, int col_count, char **values, char **col_names)
     return 0;
 }
 
+static vector<string> g_history;
+static struct termios g_orig_termios;
+static bool g_raw_mode_active = false;
+static volatile sig_atomic_t g_interrupted = 0;
+
+static void disableRawMode()
+{
+    if (g_raw_mode_active)
+    {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_orig_termios);
+        g_raw_mode_active = false;
+    }
+}
+
+static void enableRawMode()
+{
+    tcgetattr(STDIN_FILENO, &g_orig_termios);
+    struct termios raw = g_orig_termios;
+    raw.c_lflag &= ~(ECHO | ICANON);
+    raw.c_iflag &= ~(IXON | ICRNL);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+    g_raw_mode_active = true;
+    setvbuf(stdin, nullptr, _IONBF, 0);
+}
+
+static void handleSigint(int)
+{
+    g_interrupted = 1;
+}
+
+static int waitAndGetchar(int timeout_ms)
+{
+    struct pollfd pfd{STDIN_FILENO, POLLIN, 0};
+    int r = poll(&pfd, 1, timeout_ms);
+    if (r <= 0)
+        return -1;
+    return getchar();
+}
+
+static bool readLineRaw(const string &prompt, string &out)
+{
+    if (!isatty(STDIN_FILENO))
+    {
+        printf("%s", prompt.c_str());
+        fflush(stdout);
+        return (bool)getline(cin, out);
+    }
+
+    printf("%s", prompt.c_str());
+    fflush(stdout);
+    enableRawMode();
+
+    size_t cursor = 0;
+    string buf, saved_current;
+    int hist_pos = (int)g_history.size();
+
+    auto redraw = [&]()
+    {
+        printf("\r\x1b[K%s%s", prompt.c_str(), buf.c_str());
+        for (size_t i = buf.size(); i > cursor; i--)
+            printf("\b");
+        fflush(stdout);
+    };
+
+    bool eof = false;
+    while (true)
+    {
+        int c = waitAndGetchar(-1);
+        if (c < 0)
+        {
+            if (g_interrupted)
+            {
+                // Safe to do real cleanup here: this is ordinary control
+                // flow after poll() returned, not signal-handler context.
+                disableRawMode();
+                printf("\n");
+                exit(130);
+            }
+            eof = true;
+            break;
+        }
+        if (c == EOF)
+        {
+            eof = true;
+            break;
+        }
+        if (c == '\r' || c == '\n')
+        {
+            printf("\n");
+            break;
+        }
+        else if (c == 127 || c == 8) // backspace
+        {
+            if (cursor > 0)
+            {
+                buf.erase(cursor - 1, 1);
+                cursor--;
+                redraw();
+            }
+        }
+        else if (c == 27) // ESC sequence, or a standalone Escape keypress
+        {
+            int c1 = waitAndGetchar(50);
+            if (c1 == '[')
+            {
+                int c2 = waitAndGetchar(50);
+                if (c2 == 'A') // up
+                {
+                    if (hist_pos > 0)
+                    {
+                        if (hist_pos == (int)g_history.size())
+                            saved_current = buf;
+                        hist_pos--;
+                        buf = g_history[hist_pos];
+                        cursor = buf.size();
+                        redraw();
+                    }
+                }
+                else if (c2 == 'B') // down
+                {
+                    if (hist_pos < (int)g_history.size())
+                    {
+                        hist_pos++;
+                        buf = (hist_pos == (int)g_history.size()) ? saved_current : g_history[hist_pos];
+                        cursor = buf.size();
+                        redraw();
+                    }
+                }
+                else if (c2 == 'C') // right
+                {
+                    if (cursor < buf.size())
+                    {
+                        cursor++;
+                        redraw();
+                    }
+                }
+                else if (c2 == 'D') // left
+                {
+                    if (cursor > 0)
+                    {
+                        cursor--;
+                        redraw();
+                    }
+                }
+                else if (c2 >= '0' && c2 <= '9')
+                {
+                    waitAndGetchar(50);
+                }
+            }
+        }
+        else if (c >= 32 && c < 127) // printable
+        {
+            buf.insert(cursor, 1, (char)c);
+            cursor++;
+            redraw();
+        }
+    }
+
+    disableRawMode();
+    out = buf;
+    return !eof;
+}
+
 static string readSQL(const string &db_prompt)
 {
     string buffer;
     bool first = true;
     while (true)
     {
-        if (first)
-            printf("flexql [%s]> ", db_prompt.c_str());
-        else
-            printf("         ---> ");
-        fflush(stdout);
+        string db_col = (db_prompt == "none") ? c(DIM) : c(BMAGENTA);
+        string prompt = first
+                            ? (string(c(BGREEN)) + "flexql" + c(RESET) + " [" + db_col + db_prompt + c(RESET) + "]" + c(BOLD) + "> " + c(RESET))
+                            : (string(c(DIM)) + "         ---> " + c(RESET));
         string line;
-        if (!getline(cin, line))
+        if (!readLineRaw(prompt, line))
             return ".exit";
         if (!buffer.empty())
             buffer += ' ';
         buffer += line;
-        if (!buffer.empty() && buffer[0] == '.')
+        bool done = (buffer[0] == '.') || (buffer.find(';') != string::npos);
+        if (done)
+        {
+            if (g_history.empty() || g_history.back() != buffer)
+                g_history.push_back(buffer);
             return buffer;
-        if (buffer.find(';') != string::npos)
-            return buffer;
+        }
         first = false;
     }
 }
 
 int main(int argc, char *argv[])
 {
+    signal(SIGINT, handleSigint);
+    atexit(disableRawMode);
+
     int port = (argc > 2) ? stoi(argv[2]) : 3000;
     const char *host = (argc > 1) ? argv[1] : "127.0.0.1";
-    
+
     FlexQL *db = nullptr;
     if (flexql_open(host, port, &db) != FLEXQL_OK)
     {
-        fprintf(stderr, "ERROR: Cannot connect to FlexQL server at %s:%d\n", host, port);
+        fprintf(stderr, "%sERROR:%s Cannot connect to FlexQL server at %s:%d\n", e(BRED), e(RESET), host, port);
         return 1;
     }
 
-    cout << "\nFlexQL Client - connected to " << host << ":" << port << endl;
-    cout << "+-------------------------------------------------------------------------+\n";
-    cout << "| Connected to FlexQL server.                                             |\n";
-    cout << "| Type SQL ending with ';' | .help | .exit                                |\n";
-    cout << "|                                                                         |\n";
-    cout << "| Quick start:                                                            |\n";
-    cout << "|   SHOW DATABASES;              -- list existing databases               |\n";
-    cout << "|   CREATE DATABASE Demo_DB;     -- create a new database                 |\n";
-    cout << "|   USE Demo_DB;                 -- select it before any table operations |\n";
-    cout << "+-------------------------------------------------------------------------+\n\n";
+    // Border color, reset, and a few shorthands for the banner.
+    const string B = c(CYAN), R = c(RESET), K = c(BYELLOW), D = c(DIM), H = c(BOLD);
+    cout << "\n" << c(BGREEN) << "FlexQL Client" << R << " - connected to "
+         << c(BMAGENTA) << host << ":" << port << R << endl;
+    cout << B << "+-------------------------------------------------------------------------+" << R << "\n";
+    cout << B << "|" << R << H << " Connected to FlexQL server.                                             " << R << B << "|" << R << "\n";
+    cout << B << "|" << R << " Type SQL ending with " << K << "';'" << R << " | " << K << ".help" << R << " | " << K << ".exit" << R << "                                " << B << "|" << R << "\n";
+    cout << B << "|" << R << "                                                                         " << B << "|" << R << "\n";
+    cout << B << "|" << R << H << " Quick start:                                                            " << R << B << "|" << R << "\n";
+    cout << B << "|" << R << "   " << K << "SHOW DATABASES;          " << R << "    " << D << "-- list existing databases               " << R << B << "|" << R << "\n";
+    cout << B << "|" << R << "   " << K << "CREATE DATABASE Demo_DB; " << R << "    " << D << "-- create a new database                 " << R << B << "|" << R << "\n";
+    cout << B << "|" << R << "   " << K << "USE Demo_DB;             " << R << "    " << D << "-- select it before any table operations " << R << B << "|" << R << "\n";
+    cout << B << "+-------------------------------------------------------------------------+" << R << "\n\n";
 
     string current_db = "none";
     while (true)
@@ -144,33 +337,42 @@ int main(int argc, char *argv[])
         input = input.substr(s);
         if (input == ".exit" || input == ".quit")
         {
-            printf("Goodbye.\n");
+            printf("%sGoodbye.%s\n", c(BMAGENTA), c(RESET));
             break;
         }
         if (input == ".help")
         {
-            printf(
-                "\n  Database management:\n"
-                "    CREATE DATABASE name;                — create a new database\n"
-                "    SHOW DATABASES;                      — list all databases\n"
-                "    USE name;                            — select active database\n"
-                "    SHOW TABLES;                         — list tables in current db\n"
-                "\n  Table commands (require USE first):\n"
-                "    CREATE TABLE t (col TYPE [PK] [NOT NULL], ...);  — create table\n"
-                "    CREATE TABLE IF NOT EXISTS t (...);              — safe create\n"
-                "    INSERT INTO t VALUES (v1,v2,...);                — insert row\n"
-                "    INSERT INTO t VALUES (...),(...);                — batch insert\n"
-                "    INSERT INTO t VALUES (...) EXPIRY N;             — row expires in N seconds\n"
-                "    DELETE FROM t;                                   — delete all rows\n"
-                "    DELETE FROM t WHERE col op val;                  — conditional delete\n"
-                "    SELECT * FROM t;                                 — select all\n"
-                "    SELECT col1,col2 FROM t;                         — select columns\n"
-                "    SELECT * FROM t WHERE col op val;                — filter rows\n"
-                "    SELECT * FROM t ORDER BY col [ASC|DESC];         — ordered results\n"
-                "    SELECT * FROM a INNER JOIN b ON a.x = b.y;\n"
-                "\n  Types:     DECIMAL   VARCHAR(n)   TEXT\n"
-                "  Operators: =   !=   <   >   <=   >=\n"
-                "\n  Dot-commands:  .help   .exit\n\n");
+            auto section = [](const char *title)
+            { printf("\n  %s%s%s\n", c(BGREEN), title, c(RESET)); };
+            auto cmd = [](const char *syntax, const char *desc)
+            {
+                printf("    %s%-49s%s", c(YELLOW), syntax, c(RESET));
+                if (*desc)
+                    printf(" %s— %s%s", c(DIM), desc, c(RESET));
+                printf("\n");
+            };
+
+            section("Database management:");
+            cmd("CREATE DATABASE name;", "create a new database");
+            cmd("SHOW DATABASES;", "list all databases");
+            cmd("USE name;", "select active database");
+            cmd("SHOW TABLES;", "list tables in current db");
+            section("Table commands (require USE first):");
+            cmd("CREATE TABLE t (col TYPE [PK] [NOT NULL], ...);", "create table");
+            cmd("CREATE TABLE IF NOT EXISTS t (...);", "safe create");
+            cmd("INSERT INTO t VALUES (v1,v2,...);", "insert row");
+            cmd("INSERT INTO t VALUES (...),(...);", "batch insert");
+            cmd("INSERT INTO t VALUES (...) EXPIRY N;", "row expires in N seconds");
+            cmd("DELETE FROM t;", "delete all rows");
+            cmd("DELETE FROM t WHERE col op val;", "conditional delete");
+            cmd("SELECT * FROM t;", "select all");
+            cmd("SELECT col1,col2 FROM t;", "select columns");
+            cmd("SELECT * FROM t WHERE col op val;", "filter rows");
+            cmd("SELECT * FROM t ORDER BY col [ASC|DESC];", "ordered results");
+            cmd("SELECT * FROM a INNER JOIN b ON a.x = b.y;", "");
+            printf("\n  %sTypes:%s     %sDECIMAL   VARCHAR(n)   TEXT%s\n", c(BGREEN), c(RESET), c(CYAN), c(RESET));
+            printf("  %sOperators:%s %s=   !=   <   >   <=   >=%s\n", c(BGREEN), c(RESET), c(CYAN), c(RESET));
+            printf("\n  %sDot-commands:%s  %s.help   .exit%s\n\n", c(BGREEN), c(RESET), c(CYAN), c(RESET));
             continue;
         }
 
@@ -181,10 +383,13 @@ int main(int argc, char *argv[])
 
         CallbackState state;
         char *errmsg = nullptr;
+        auto q_start = chrono::high_resolution_clock::now();
         int rc = flexql_exec(db, input.c_str(), collectRow, &state, &errmsg);
+        auto q_end = chrono::high_resolution_clock::now();
+        long long q_elapsed = chrono::duration_cast<chrono::milliseconds>(q_end - q_start).count();
         if (rc != FLEXQL_OK)
         {
-            fprintf(stderr, "  %s\n\n", errmsg ? errmsg : "Unknown error");
+            fprintf(stderr, "  %s%s%s\n\n", e(BRED), errmsg ? errmsg : "Unknown error", e(RESET));
             flexql_free(errmsg);
         }
         else
@@ -192,8 +397,9 @@ int main(int argc, char *argv[])
             if (state.header_set)
                 state.tp.print();
             else
-                printf("  Query OK.\n\n");
+                printf("%s-> Query OK.%s\n\n", c(BGREEN), c(RESET));
 
+            printf("%s-> (%lld ms)%s\n\n", c(DIM), q_elapsed, c(RESET));
             if (is_use)
             {
                 string tmp = input;

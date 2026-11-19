@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <climits>
 #include <algorithm>
+#include <unordered_map>
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -120,6 +121,7 @@ ResultRow Project_Row(const Row &row, const TableSchema &sc, const vector<Column
             res.values.push_back(row.fields[idx].Convert_To_String());
         }
     }
+
     return res;
 }
 
@@ -136,6 +138,18 @@ void Database::Flush_DB()
         lock_guard tl(t->table_mutex);
         t->Flush_Table();
     }
+}
+
+int Database::Purge_Expired()
+{
+    shared_lock lk(tables_mutex);
+    int total = 0;
+    for (auto &[n, t] : tables)
+    {
+        lock_guard tl(t->table_mutex);
+        total += t->Purge_Expired();
+    }
+    return total;
 }
 
 TableManager *Database::Get_Table(const string &name)
@@ -301,7 +315,7 @@ string Database::Execute_Select(const ParsedQuery &q, RowCB cb)
         {
             if (!cr.tbl.empty())
                 continue;
-            
+
             int idx = tm->schema.Find_Column(cr.col);
             if (idx < 0)
                 return "ERROR: Unknown column '" + cr.col +
@@ -315,7 +329,8 @@ string Database::Execute_Select(const ParsedQuery &q, RowCB cb)
             return;
         bool desc = q.order.desc;
         string col = q.order.col.col;
-        stable_sort(rows.begin(), rows.end(), [&](const ResultRow &a, const ResultRow &b) {
+        stable_sort(rows.begin(), rows.end(), [&](const ResultRow &a, const ResultRow &b)
+                    {
             int idx = -1;
             for (int i = 0; i < (int)a.column_names.size(); i++)
             {
@@ -338,8 +353,7 @@ string Database::Execute_Select(const ParsedQuery &q, RowCB cb)
             }
             catch (...){}
 
-            return desc ? va > vb : va < vb;
-        });
+            return desc ? va > vb : va < vb; });
     };
 
     if (q.has_join)
@@ -354,44 +368,91 @@ string Database::Execute_Select(const ParsedQuery &q, RowCB cb)
         lock_guard tl(tm->table_mutex);
         lock_guard jl(jt->table_mutex);
 
-        tm->Scan([&](const Row &lr) -> bool
-                 {
-            jt->Scan([&](const Row &rr) -> bool {
-                int li = tm->schema.Find_Column(q.join.left.col);
-                int ri = jt->schema.Find_Column(q.join.right.col);
-
-                if (li < 0 || ri < 0) return true;
-                if (lr.fields[li].Convert_To_String() != rr.fields[ri].Convert_To_String()) return true;
-
-                if (q.has_where)
+        vector<int> left_idx, right_idx;
+        if (q.join.has_on)
+        {
+            int li = tm->schema.Find_Column(q.join.left.col);
+            int ri = jt->schema.Find_Column(q.join.right.col);
+            if (li >= 0 && ri >= 0)
+            {
+                left_idx.push_back(li);
+                right_idx.push_back(ri);
+            }
+        }
+        else
+        {
+            for (uint32_t i = 0; i < tm->schema.num_cols; i++)
+            {
+                int ri = jt->schema.Find_Column(tm->schema.cols[i].name);
+                if (ri >= 0)
                 {
-                    for (const auto &w : q.where_list)
+                    left_idx.push_back((int)i);
+                    right_idx.push_back(ri);
+                }
+            }
+            if (left_idx.empty())
+                return "ERROR: No common column found between '" + tn + "' and '" + jn + "' to join on. Specify ON explicitly.";
+        }
+
+        if (!left_idx.empty())
+        {
+            auto make_key = [](const Row &row, const vector<int> &idxs) -> string
+            {
+                string k;
+                for (int idx : idxs)
+                {
+                    k += row.fields[idx].Convert_To_String();
+                    k += '\x1f';
+                }
+                return k;
+            };
+
+            unordered_map<string, vector<Row>> right_index;
+            jt->Scan([&](const Row &rr) -> bool
+                     {
+                right_index[make_key(rr, right_idx)].push_back(rr);
+                return true; });
+
+            tm->Scan([&](const Row &lr) -> bool
+                     {
+                auto it = right_index.find(make_key(lr, left_idx));
+                if (it == right_index.end())
+                    return true;
+
+                for (const Row &rr : it->second)
+                {
+                    if (q.has_where)
                     {
-                        string wt   = w.col.tbl;
-                        string wcol = w.col.col;
-                        int ci = tm->schema.Find_Column(wcol);
-                        if (ci >= 0 && (wt == tn || wt.empty()))
-                            if (!Field_Matches(lr.fields[ci], w.op, w.val)) return true;
-                        ci = jt->schema.Find_Column(wcol);
-                        if (ci >= 0 && (wt == jn || wt.empty()))
-                            if (!Field_Matches(rr.fields[ci], w.op, w.val)) return true;
+                        bool ok = true;
+                        for (const auto &w : q.where_list)
+                        {
+                            string wt   = w.col.tbl;
+                            string wcol = w.col.col;
+                            int ci = tm->schema.Find_Column(wcol);
+                            if (ci >= 0 && (wt == tn || wt.empty()))
+                                if (!Field_Matches(lr.fields[ci], w.op, w.val)) { ok = false; break; }
+                            ci = jt->schema.Find_Column(wcol);
+                            if (ci >= 0 && (wt == jn || wt.empty()))
+                                if (!Field_Matches(rr.fields[ci], w.op, w.val)) { ok = false; break; }
+                        }
+                        if (!ok)
+                            continue;
                     }
+
+                    ResultRow res;
+                    auto rl  = Project_Row(lr, tm->schema, q.selected_columns, q.select_star, tn);
+                    auto rr2 = Project_Row(rr, jt->schema, q.selected_columns, q.select_star, jn);
+
+                    for (auto &c : rl.column_names)  res.column_names.push_back(c);
+                    for (auto &v : rl.values)        res.values.push_back(v);
+                    for (auto &c : rr2.column_names) res.column_names.push_back(c);
+                    for (auto &v : rr2.values)       res.values.push_back(v);
+
+                    results.push_back(move(res));
                 }
 
-                ResultRow res;
-                auto rl  = Project_Row(lr, tm->schema, q.selected_columns, q.select_star, tn);
-                auto rr2 = Project_Row(rr, jt->schema, q.selected_columns, q.select_star, jn);
-
-                for (auto &c : rl.column_names)  res.column_names.push_back(c);
-                for (auto &v : rl.values)     res.values.push_back(v);
-                for (auto &c : rr2.column_names) res.column_names.push_back(c);
-                for (auto &v : rr2.values)    res.values.push_back(v);
-
-                results.push_back(move(res));
-                return true;
-            });
-
-            return true; });
+                return true; });
+        }
 
         applyOrder(results);
         for (auto &r : results)
@@ -459,7 +520,10 @@ string Database::Execute_Select(const ParsedQuery &q, RowCB cb)
     int32_t lo = INT32_MIN, hi = INT32_MAX;
     bool lo_inc = true, hi_inc = true;
     bool has_eq = false;
-    bool all_on_pk = q.has_where && !q.where_list.empty() && (tm->schema.cols[pk_col].type == ColType::INT);
+    double eq_val = 0.0;
+    ColType pk_type = tm->schema.cols[pk_col].type;
+    bool pk_is_decimal = (pk_type == ColType::DECIMAL);
+    bool all_on_pk = q.has_where && !q.where_list.empty() && (pk_type == ColType::INT || pk_is_decimal);
 
     if (all_on_pk)
     {
@@ -476,15 +540,22 @@ string Database::Execute_Select(const ParsedQuery &q, RowCB cb)
                 break;
             }
 
-            int32_t v = (int32_t)stod(w.val);
+            double vd = stod(w.val);
+            int32_t v = (int32_t)vd;
             if (w.op == "=")
             {
                 has_eq = true;
+                eq_val = vd;
                 lo = hi = v;
                 lo_inc = hi_inc = true;
                 break;
             }
             else if (w.op == "!=")
+            {
+                all_on_pk = false;
+                break;
+            }
+            else if (pk_is_decimal)
             {
                 all_on_pk = false;
                 break;
@@ -528,12 +599,18 @@ string Database::Execute_Select(const ParsedQuery &q, RowCB cb)
     {
         lock_guard tl(tm->table_mutex);
         Row row;
-        if (tm->Find_By_FK(lo, row))
+        bool found = tm->Find_By_FK(lo, row);
+        bool trustworthy = found && (!pk_is_decimal || row.fields[pk_col].double_value == eq_val);
+        if (trustworthy)
         {
             rows++;
             cb(Project_Row(row, tm->schema, q.selected_columns, q.select_star));
+            return "OK: " + to_string(rows) + " row(s) returned. [B+ Tree point lookup]";
         }
-        return "OK: " + to_string(rows) + " row(s) returned. [B+ Tree point lookup]";
+        if (!pk_is_decimal)
+        {
+            return "OK: 0 row(s) returned.";
+        }
     }
 
     if (all_on_pk && !has_eq && (lo != INT32_MIN || hi != INT32_MAX))
@@ -693,4 +770,13 @@ void DatabaseManager::Flush_DB_Manager()
     lock_guard lk(database_mutex);
     for (auto &[n, db] : databases)
         db->Flush_DB();
+}
+
+int DatabaseManager::Purge_Expired()
+{
+    lock_guard lk(database_mutex);
+    int total = 0;
+    for (auto &[n, db] : databases)
+        total += db->Purge_Expired();
+    return total;
 }

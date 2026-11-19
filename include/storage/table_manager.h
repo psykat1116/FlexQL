@@ -27,6 +27,7 @@ public:
     vector<Row> Find_By_Range(int32_t lo, bool lo_inc, int32_t hi, bool hi_inc);
     pair<uint32_t, int> Insert_Row(const Row &row);
     int Delete_Where(function<bool(const Row &)> pred);
+    int Purge_Expired();
     void Rebuild_Index();
 
     uint32_t Page_Count() const { return number_of_pages; };

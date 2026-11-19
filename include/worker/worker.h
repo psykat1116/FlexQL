@@ -1,5 +1,6 @@
 #pragma once
 #include <queue>
+#include <algorithm>
 #include <mutex>
 #include <thread>
 #include <atomic>
@@ -10,7 +11,7 @@
 class ThreadPool
 {
 public:
-    explicit ThreadPool(size_t num_threads);
+    explicit ThreadPool(size_t num_threads = std::max(4u, std::thread::hardware_concurrency()));
     ~ThreadPool();
 
     void enqueue(std::function<void()> task);

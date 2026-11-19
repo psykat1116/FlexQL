@@ -19,6 +19,7 @@ public:
     Database(const string &root_dir, const string &db_name);
 
     void Flush_DB();
+    int Purge_Expired();
     vector<string> Table_Names();
     string Get_Name() const { return database_name; }
     TableManager *Get_Table(const string &name);
@@ -42,6 +43,7 @@ public:
     explicit DatabaseManager(const string &root_dir);
 
     void Flush_DB_Manager();
+    int Purge_Expired();
     vector<string> List_Databases();
     Database *Get_Database(const string &name);
     string Create_Database(const string &name);

@@ -20,17 +20,37 @@
 #include "worker/worker.h"
 #include "query/executor.h"
 #include "network/net_utils.h"
+#include "common/term_colors.h"
 #include "common/flexql_protocol.h"
 
 using namespace std;
+using namespace term;
 using namespace chrono;
 
 static atomic<bool> global_stop = false;
 static DatabaseManager *global_manager = nullptr;
+static constexpr int DEFAULT_REAPER_INTERVAL_SECS = 30;
+
+static void reaperLoop(DatabaseManager &mgr, int interval_secs)
+{
+    while (!global_stop)
+    {
+        for (int i = 0; i < interval_secs && !global_stop; i++)
+            this_thread::sleep_for(seconds(1));
+
+        if (global_stop)
+            break;
+
+        int purged = mgr.Purge_Expired();
+        if (purged > 0)
+            cout << c(BYELLOW) << "[reaper]" << c(RESET) << " purged " << c(YELLOW) << purged << c(RESET) << " expired row(s)\n";
+    }
+}
 
 static void onSignal(int)
 {
-    cout << "\n[server] Flushing and shutting down...\n";
+    cout << "\n"
+         << c(BBLUE) << "[server]" << c(RESET) << c(MAGENTA) << " Flushing and shutting down..." << c(RESET) << "\n";
 
     global_stop = true;
     if (global_manager)
@@ -41,6 +61,14 @@ static void onSignal(int)
 
 static void handleClient(int cfd, DatabaseManager &manager)
 {
+    struct FdCloser
+    {
+        int fd;
+        ~FdCloser() { 
+            ::close(fd); 
+        }
+    } fd_closer{cfd};
+
     int flag = 1;
     ::setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 
@@ -56,6 +84,19 @@ static void handleClient(int cfd, DatabaseManager &manager)
             break;
         if (hdr.type != MSG_QUERY)
             break;
+
+        // Reject oversized queries before allocating. The connection is
+        // closed afterwards: the unread payload is still in the stream,
+        // so there's no way to resync to the next message header.
+        if (hdr.length > MAX_QUERY_LENGTH)
+        {
+            cerr << e(BRED) << "[server] fd " << cfd << ": query length " << hdr.length
+                 << " exceeds limit of " << MAX_QUERY_LENGTH << " bytes, closing connection" << e(RESET) << "\n";
+            Net_Send_Message(cfd, MSG_STATUS,
+                             "ERROR: Query too large (" + to_string(hdr.length) + " bytes, limit is " +
+                                 to_string(MAX_QUERY_LENGTH) + " bytes). Connection closed.");
+            break;
+        }
 
         string sql(hdr.length, '\0');
         if (hdr.length > 0 && !Net_Receive_All(cfd, sql.data(), hdr.length))
@@ -154,14 +195,13 @@ static void handleClient(int cfd, DatabaseManager &manager)
 
         Net_Send_Message(cfd, MSG_STATUS, status);
     }
-
-    ::close(cfd);
 }
 
 int main(int argc, char *argv[])
 {
     int port = (argc > 1) ? stoi(argv[1]) : 3000;
     string data_dir = (argc > 2) ? argv[2] : "./database";
+    int reaper_interval_secs = (argc > 3) ? stoi(argv[3]) : DEFAULT_REAPER_INTERVAL_SECS;
 
     mkdir(data_dir.c_str(), 0755);
 
@@ -175,7 +215,7 @@ int main(int argc, char *argv[])
     int sfd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (sfd < 0)
     {
-        cerr << "[server] socket() failed\n";
+        cerr << e(BRED) << "[server] socket() failed" << e(RESET) << "\n";
         return 1;
     }
 
@@ -189,7 +229,7 @@ int main(int argc, char *argv[])
 
     if (::bind(sfd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0)
     {
-        cerr << "[server] bind() failed on port " << port << "\n";
+        cerr << e(BRED) << "[server] bind() failed on port " << port << e(RESET) << "\n";
         return 1;
     }
     ::listen(sfd, 128);
@@ -197,11 +237,17 @@ int main(int argc, char *argv[])
     size_t num_threads = max(thread::hardware_concurrency(), 4u);
     ThreadPool pool(num_threads);
 
-    cout << "\n+------------------------------------------+\n";
-    cout << "|  FlexQL Server - PORT " << left << setw(19) << port << "|\n";
-    cout << "|  Thread pool: " << setw(26) << (to_string(num_threads) + " worker(s)") << "|\n";
-    cout << "|  Ctrl + C to stop.                      |\n";
-    cout << "+------------------------------------------+\n\n";
+    thread reaper(reaperLoop, ref(mgr), reaper_interval_secs);
+    reaper.detach();
+
+    const string B = c(CYAN), R = c(RESET);
+    cout << "\n"
+         << B << "+------------------------------------------+" << R << "\n";
+    cout << B << "|" << R << "  " << c(BGREEN) << "FlexQL Server" << R << " - PORT " << c(BMAGENTA) << left << setw(19) << port << R << B << "|" << R << "\n";
+    cout << B << "|" << R << "  Thread pool: " << c(YELLOW) << setw(26) << (to_string(num_threads) + " worker(s)") << R << B << "|" << R << "\n";
+    cout << B << "|" << R << "  TTL reaper: " << c(YELLOW) << setw(27) << ("every " + to_string(reaper_interval_secs) + "s") << R << B << "|" << R << "\n";
+    cout << B << "|" << R << c(DIM) << "  Ctrl + C to stop.                       " << R << B << "|" << R << "\n";
+    cout << B << "+------------------------------------------+" << R << "\n\n";
 
     while (!global_stop)
     {
@@ -211,16 +257,18 @@ int main(int argc, char *argv[])
         if (cfd < 0)
         {
             if (!global_stop)
-                cerr << "[server] accept() failed\n";
+                cerr << e(BRED) << "[server] accept() failed" << e(RESET) << "\n";
 
             continue;
         }
 
         char ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &ca.sin_addr, ip, sizeof(ip));
-        cout << "[server] Client " << ip << ":" << ntohs(ca.sin_port) << "  (fd = " << cfd << ")\n";
+        cout << c(BBLUE) << "[server]" << c(RESET) << " Client " << c(BGREEN) << ip << ":" << ntohs(ca.sin_port) << c(RESET)
+             << c(DIM) << "  (fd = " << cfd << ")" << c(RESET) << "\n";
 
-        pool.enqueue([cfd, &mgr]() { handleClient(cfd, mgr); });
+        pool.enqueue([cfd, &mgr]()
+                     { handleClient(cfd, mgr); });
     }
 
     ::close(sfd);

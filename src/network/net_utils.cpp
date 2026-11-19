@@ -36,9 +36,7 @@ bool Net_Receive_All(int fd, void *buf, size_t len)
 bool Net_Send_Message(int fd, uint32_t type, const std::string &payload)
 {
     MessageHeader hdr{type, (uint32_t)payload.size()};
-    // Use writev() to send header + payload atomically in one syscall.
-    // This eliminates one round-trip through the kernel per message and
-    // avoids Nagle coalescing on the caller's side.
+
     struct iovec iov[2];
     iov[0].iov_base = &hdr;
     iov[0].iov_len = sizeof(hdr);
@@ -49,6 +47,7 @@ bool Net_Send_Message(int fd, uint32_t type, const std::string &payload)
     ssize_t sent = ::writev(fd, iov, nvecs);
     if (sent == total)
         return true;
+        
     // Partial write: fall back to net_sendAll for remainder
     return Net_Send_All(fd, &hdr, sizeof(hdr)) && (payload.empty() || Net_Send_All(fd, payload.data(), payload.size()));
 }

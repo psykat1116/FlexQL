@@ -46,6 +46,7 @@ typedef struct
     string jtbl;
     ColumnReference left;
     ColumnReference right;
+    bool has_on = true;
 } JoinClause;
 
 struct OrderBy

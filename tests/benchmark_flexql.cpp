@@ -1,21 +1,24 @@
 #include <chrono>
+#include <thread>
 #include <string>
 #include <vector>
 #include <sstream>
 #include <iostream>
+#include <algorithm>
+#include <functional>
 #include "common/flexql.h"
 
 using namespace std;
 using namespace std::chrono;
 
-static const int INSERT_BATCH_SIZE = 10000; // if you implement batch inserts in flexql, you can increase this for better performance
-static const long long DEFAULT_INSERT_ROWS = 100000LL; // 100k rows by default for insertion benchmark
+static const int INSERT_BATCH_SIZE = 10000;
+static const long long DEFAULT_INSERT_ROWS = 100000LL;
 
 struct FlexQLError
 {
     char *msg = nullptr;
     char **ptr() { return &msg; }
-    const char *get() const { return msg ? msg : "unknown error"; }
+    const char *get() const { return msg ? msg : "Unknown Error Occured"; }
 
     ~FlexQLError()
     {
@@ -107,7 +110,11 @@ static bool query_rows(FlexQL *db, const string &sql, vector<string> &out_rows)
     };
 
     char *errMsg = nullptr;
+    auto start = high_resolution_clock::now();
     int rc = flexql_exec(db, sql.c_str(), cb, &collector, &errMsg);
+    auto end = high_resolution_clock::now();
+    long long elapsed = duration_cast<milliseconds>(end - start).count();
+
     if (rc != FLEXQL_OK)
     {
         cout << "[FAIL] " << sql << " -> " << (errMsg ? errMsg : "unknown error") << "\n";
@@ -118,6 +125,7 @@ static bool query_rows(FlexQL *db, const string &sql, vector<string> &out_rows)
         return false;
     }
 
+    cout << "[INFO] " << sql << " | rows=" << collector.rows.size() << " | " << elapsed << " ms\n";
     out_rows = collector.rows;
     return true;
 }
@@ -198,12 +206,7 @@ static bool run_data_level_unit_tests(FlexQL *db)
         }
     };
 
-    record(run_exec(
-               db,
-               "CREATE TABLE TEST_USERS(ID DECIMAL, NAME VARCHAR(64), BALANCE DECIMAL, EXPIRES_AT DECIMAL);",
-               "CREATE TABLE TEST_USERS"),
-           1);
-
+    record(run_exec(db, "CREATE TABLE TEST_USERS(ID DECIMAL, NAME VARCHAR(64), BALANCE DECIMAL, EXPIRES_AT DECIMAL);", "CREATE TABLE TEST_USERS"), 1);
     auto insert_test_user = [&](long long id, const string &name, long long balance, long long expires_at) -> bool
     {
         stringstream ss;
@@ -280,6 +283,23 @@ static bool run_data_level_unit_tests(FlexQL *db)
     record(expect_query_failure(db, "SELECT GHOST_COL FROM TEST_USERS;", "Invalid column should fail"), 2);
     record(expect_query_failure(db, "SELECT * FROM NO_SUCH_TABLE;", "Missing table should fail"), 2);
 
+    // ── TTL / EXPIRY ─────────────────────────────────────────────────────
+    // Verifies the "INSERT ... EXPIRY N" clause: a row must be visible
+    // before its TTL elapses and disappear from query results afterwards.
+    // This is the same Has_Expired() check the background reaper relies
+    // on to find sweep candidates, exercised here purely at the SQL level.
+    record(run_exec(db, "CREATE TABLE TEST_TTL(ID DECIMAL, VAL VARCHAR(32));", "CREATE TABLE TEST_TTL"), 1);
+    record(run_exec(db, "INSERT INTO TEST_TTL VALUES (1, 'short_lived') EXPIRY 1;", "INSERT TEST_TTL short-lived (EXPIRY 1s)"), 1);
+    record(run_exec(db, "INSERT INTO TEST_TTL VALUES (2, 'long_lived');", "INSERT TEST_TTL long-lived (no EXPIRY)"), 1);
+
+    query_rows(db, "SELECT ID FROM TEST_TTL;", rows);
+    record(assert_rows_equal("TTL row visible before expiry", rows, {"1", "2"}), 2);
+
+    this_thread::sleep_for(seconds(2));
+
+    query_rows(db, "SELECT ID FROM TEST_TTL;", rows);
+    record(assert_rows_equal("TTL row hidden after expiry", rows, {"2"}), 2);
+
     int passed_tests = total_tests - failed_tests;
     cout << "\nUnit Test Summary: " << passed_tests << "/" << total_tests << " passed, "
          << failed_tests << " failed.\n";
@@ -288,17 +308,9 @@ static bool run_data_level_unit_tests(FlexQL *db)
     return all_ok;
 }
 
-static bool run_insert_benchmark(FlexQL *db, long long target_rows)
+static bool run_batch_insert(FlexQL *db, const string &table, long long target_rows, const function<string(long long)> &row_values, const string &label)
 {
-    if (!run_exec(
-            db,
-            "CREATE TABLE BIG_USERS(ID DECIMAL, NAME VARCHAR(64), EMAIL VARCHAR(64), BALANCE DECIMAL, EXPIRES_AT DECIMAL);",
-            "CREATE TABLE BIG_USERS"))
-    {
-        return false;
-    }
-
-    cout << "\nStarting insertion benchmark for " << target_rows << " rows...\n";
+    cout << "\nStarting " << label << " for " << target_rows << " rows into " << table << "...\n";
     auto bench_start = high_resolution_clock::now();
 
     long long inserted = 0;
@@ -312,17 +324,13 @@ static bool run_insert_benchmark(FlexQL *db, long long target_rows)
     while (inserted < target_rows)
     {
         stringstream ss;
-        ss << "INSERT INTO BIG_USERS VALUES ";
+        ss << "INSERT INTO " << table << " VALUES ";
 
         int in_batch = 0;
         while (in_batch < INSERT_BATCH_SIZE && inserted < target_rows)
         {
             long long id = inserted + 1;
-            ss << "(" << id
-               << ", 'user" << id << "'"
-               << ", 'user" << id << "@mail.com'"
-               << ", " << (1000.0 + (id % 10000))
-               << ", 1893456000)";
+            ss << row_values(id);
             inserted++;
             in_batch++;
             if (in_batch < INSERT_BATCH_SIZE && inserted < target_rows)
@@ -335,7 +343,7 @@ static bool run_insert_benchmark(FlexQL *db, long long target_rows)
         char *errMsg = nullptr;
         if (flexql_exec(db, ss.str().c_str(), nullptr, nullptr, &errMsg) != FLEXQL_OK)
         {
-            cout << "[FAIL] INSERT BIG_USERS batch -> " << (errMsg ? errMsg : "unknown error") << "\n";
+            cout << "[FAIL] " << label << " batch -> " << (errMsg ? errMsg : "unknown error") << "\n";
             if (errMsg)
             {
                 flexql_free(errMsg);
@@ -354,12 +362,109 @@ static bool run_insert_benchmark(FlexQL *db, long long target_rows)
     long long elapsed = duration_cast<milliseconds>(bench_end - bench_start).count();
     long long throughput = (elapsed > 0) ? (target_rows * 1000LL / elapsed) : target_rows;
 
-    cout << "[PASS] INSERT benchmark complete\n";
+    cout << "[PASS] " << label << " complete\n";
     cout << "Rows inserted: " << target_rows << "\n";
     cout << "Elapsed: " << elapsed << " ms\n";
     cout << "Throughput: " << throughput << " rows/sec\n";
 
     return true;
+}
+
+static string bench_user_values(long long id)
+{
+    stringstream ss;
+    ss << "(" << id
+       << ", 'user" << id << "'"
+       << ", 'user" << id << "@mail.com'"
+       << ", " << (1000.0 + (id % 10000))
+       << ", 1893456000)";
+    return ss.str();
+}
+
+static bool run_full_command_benchmark(FlexQL *db, long long target_rows)
+{
+    bool ok = true;
+
+    cout << "\n[[...Running Full Command Benchmark (" << target_rows << " rows)...]]\n";
+
+    // CREATE TABLE / CREATE TABLE IF NOT EXISTS
+    const string create_users_sql = "CREATE TABLE BENCH_USERS(ID DECIMAL PRIMARY KEY, NAME VARCHAR(64), EMAIL VARCHAR(64), BALANCE DECIMAL, EXPIRES_AT DECIMAL);";
+    ok &= run_exec(db, create_users_sql, "CREATE TABLE BENCH_USERS");
+    ok &= run_exec(db, "CREATE TABLE IF NOT EXISTS BENCH_USERS(ID DECIMAL PRIMARY KEY, NAME VARCHAR(64), EMAIL VARCHAR(64), BALANCE DECIMAL, EXPIRES_AT DECIMAL);", "CREATE TABLE IF NOT EXISTS BENCH_USERS (safe re-create)");
+
+    // INSERT INTO t VALUES (...),(...); batch insert, target_rows rows
+    if (!run_batch_insert(db, "BENCH_USERS", target_rows, bench_user_values, "batch INSERT"))
+    {
+        return false;
+    }
+    // INSERT INTO t VALUES (v1,v2,...); single row insert
+    {
+        long long id = target_rows + 1;
+        string sql = "INSERT INTO BENCH_USERS VALUES " + bench_user_values(id) + ";";
+        ok &= run_exec(db, sql, "INSERT single row (id=" + to_string(id) + ")");
+    }
+    // INSERT INTO t VALUES (...) EXPIRY N; row with expiry
+    {
+        long long id = target_rows + 2;
+        string sql = "INSERT INTO BENCH_USERS VALUES " + bench_user_values(id) + " EXPIRY 60;";
+        ok &= run_exec(db, sql, "INSERT with EXPIRY 60s (id=" + to_string(id) + ")");
+    }
+
+    // SELECT * FROM t; select all
+    ok &= run_query(db, "SELECT * FROM BENCH_USERS;", "SELECT * FROM BENCH_USERS (full scan)");
+
+    // SELECT col1,col2 FROM t; select columns
+    ok &= run_query(db, "SELECT NAME, EMAIL FROM BENCH_USERS;", "SELECT NAME, EMAIL FROM BENCH_USERS (projection)");
+
+    // SELECT * FROM t WHERE col op val; point lookup + range filter
+    {
+        long long mid_id = target_rows / 2;
+        string sql = "SELECT * FROM BENCH_USERS WHERE ID = " + to_string(mid_id) + ";";
+        ok &= run_query(db, sql, "SELECT * WHERE ID = " + to_string(mid_id) + " (point lookup)");
+    }
+    ok &= run_query(db, "SELECT * FROM BENCH_USERS WHERE BALANCE > 5000;", "SELECT * WHERE BALANCE > 5000 (range filter)");
+
+    // SELECT * FROM t ORDER BY col [ASC|DESC]; ordered results
+    ok &= run_query(db, "SELECT * FROM BENCH_USERS ORDER BY BALANCE ASC;", "SELECT * ORDER BY BALANCE ASC");
+    ok &= run_query(db, "SELECT * FROM BENCH_USERS ORDER BY BALANCE DESC;", "SELECT * ORDER BY BALANCE DESC");
+
+    long long join_rows = target_rows;
+    ok &= run_exec(db, "CREATE TABLE BENCH_ORDERS(ORDER_ID DECIMAL PRIMARY KEY, USER_ID DECIMAL, AMOUNT DECIMAL, EXPIRES_AT DECIMAL);", "CREATE TABLE BENCH_ORDERS");
+
+    auto bench_order_values = [target_rows](long long id) -> string
+    {
+        long long user_id = ((id - 1) % target_rows) + 1;
+        long long amount = ((id * 97) % 5000) + 1; // 97 spreads amounts across 1..5000 even for small join_rows
+        stringstream ss;
+        ss << "(" << id << ", " << user_id << ", " << amount << ", 1893456000)";
+        return ss.str();
+    };
+    if (!run_batch_insert(db, "BENCH_ORDERS", join_rows, bench_order_values, "batch INSERT (join table)"))
+    {
+        return false;
+    }
+
+    // SELECT * FROM a INNER JOIN b ON a.x = b.y; full join + filtered join
+    ok &= run_query(
+        db,
+        "SELECT BENCH_USERS.NAME, BENCH_ORDERS.AMOUNT FROM BENCH_USERS "
+        "INNER JOIN BENCH_ORDERS ON BENCH_USERS.ID = BENCH_ORDERS.USER_ID;",
+        "INNER JOIN BENCH_USERS x BENCH_ORDERS (full)");
+    ok &= run_query(
+        db,
+        "SELECT BENCH_USERS.NAME, BENCH_ORDERS.AMOUNT FROM BENCH_USERS "
+        "INNER JOIN BENCH_ORDERS ON BENCH_USERS.ID = BENCH_ORDERS.USER_ID "
+        "WHERE BENCH_ORDERS.AMOUNT > 2500;",
+        "INNER JOIN filtered WHERE AMOUNT > 2500");
+
+    // DELETE FROM t WHERE col op val; conditional delete
+    ok &= run_exec(db, "DELETE FROM BENCH_ORDERS WHERE AMOUNT < 2500;", "DELETE FROM BENCH_ORDERS WHERE AMOUNT < 2500 (conditional)");
+
+    // DELETE FROM t; delete all rows
+    ok &= run_exec(db, "DELETE FROM BENCH_ORDERS;", "DELETE FROM BENCH_ORDERS (all rows)");
+    ok &= run_exec(db, "DELETE FROM BENCH_USERS;", "DELETE FROM BENCH_USERS (all rows)");
+
+    return ok;
 }
 
 int main(int argc, char **argv)
@@ -417,10 +522,11 @@ int main(int argc, char **argv)
         return ok ? 0 : 1;
     }
 
-    cout << "Running SQL subset checks plus insertion benchmark...\n";
-    cout << "Target insert rows: " << insert_rows << "\n\n";
+    cout << "Running full command benchmark plus unit tests...\n";
+    cout << "Target row count: " << insert_rows << "\n\n";
 
-    if (!run_insert_benchmark(db, insert_rows)) {
+    if (!run_full_command_benchmark(db, insert_rows))
+    {
         flexql_close(db);
         return 1;
     }

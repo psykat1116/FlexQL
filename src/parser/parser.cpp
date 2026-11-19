@@ -239,10 +239,19 @@ ParsedQuery Parser::Parse_Select()
         Consume();
         Expect(TT::JOIN);
         q.join.jtbl = Expect(TT::IDENT).val;
-        Expect(TT::ON);
-        q.join.left = Parse_Column_Reference();
-        Expect(TT::EQ);
-        q.join.right = Parse_Column_Reference();
+        if (Cur().type == TT::ON)
+        {
+            Consume();
+            q.join.left = Parse_Column_Reference();
+            Expect(TT::EQ);
+            q.join.right = Parse_Column_Reference();
+            q.join.has_on = true;
+        }
+        else
+        {
+            q.join.has_on = false;
+        }
+
         q.has_join = true;
     }
 

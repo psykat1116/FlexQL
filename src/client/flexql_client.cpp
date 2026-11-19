@@ -104,7 +104,18 @@ int flexql_exec(FlexQL *db, const char *sql, int (*callback)(void *, int, char *
     if (!db || !sql)
         return FLEXQL_ERROR;
 
-    uint32_t sql_len = (uint32_t)strlen(sql);
+    size_t full_len = strlen(sql);
+    if (full_len > MAX_QUERY_LENGTH)
+    {
+        // Fail locally: the server would reject it and drop the connection.
+        if (errmsg)
+            *errmsg = strdup(("ERROR: Query too large (" + std::to_string(full_len) + " bytes, limit is " +
+                              std::to_string(MAX_QUERY_LENGTH) + " bytes)").c_str());
+
+        return FLEXQL_ERROR;
+    }
+
+    uint32_t sql_len = (uint32_t)full_len;
     MessageHeader qhdr{MSG_QUERY, sql_len};
 
     if (!Net_Send_All(db->serverfd, &qhdr, sizeof(qhdr)) || (sql_len > 0 && !Net_Send_All(db->serverfd, sql, sql_len)))

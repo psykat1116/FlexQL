@@ -66,10 +66,6 @@ TableManager::TableManager(const std::string &dir, const std::string &table_name
             allocated_pages = number_of_pages;
         }
 
-        // Load saved index if the .idx file exists.
-        // If it is absent (server killed before first clean flush), rebuild
-        // the index by scanning the raw .tbl pages so every query that
-        // follows can use the B+ Tree rather than doing a full table scan.
         std::ifstream idx_check(index_path, std::ios::binary);
         if (idx_check.is_open())
         {
@@ -268,6 +264,47 @@ int TableManager::Delete_Where(std::function<bool(const Row &)> pred)
         Insert_Row(row);
 
     return deleted;
+}
+
+int TableManager::Purge_Expired()
+{
+    // Scan() already hides expired rows from callers, so walk raw pages
+    // directly here (like Rebuild_Index does) to actually find them.
+    std::vector<Row> survivors;
+    int expired_count = 0;
+
+    for (uint32_t pid = 0; pid < number_of_pages; pid++)
+    {
+        Page &pg = Fetch_Page(pid);
+        for (int s = 0; s < pg.Number_Of_Slots(); s++)
+        {
+            const uint8_t *raw = pg.getRow(s);
+            if (!raw)
+                continue;
+
+            Row row = Deserialize_Row(raw, schema);
+            if (Has_Expired(row.expiry_timestamp))
+                expired_count++;
+            else
+                survivors.push_back(std::move(row));
+        }
+    }
+
+    if (expired_count == 0)
+        return 0;
+
+    cache.Flush_All([](uint32_t, const Page &) {});
+    if (table_fd >= 0)
+        if (::ftruncate(table_fd, 0) != 0)
+            throw std::runtime_error("Failed to truncate table file to 0 bytes.");
+
+    number_of_pages = 0;
+    allocated_pages = 0;
+    btree.Clear_Tree();
+    for (auto &row : survivors)
+        Insert_Row(row);
+
+    return expired_count;
 }
 
 void TableManager::Write_To_Disk(uint32_t page_id, const Page &pg)

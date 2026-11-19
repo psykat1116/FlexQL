@@ -16,12 +16,11 @@ bool BPlusTree::Find_Key(int32_t key, IndexRecord &rec) const
 
 // Walk only the entries whose key satisfies lo <[=] k <[=] hi.
 // Uses std::map::lower_bound / upper_bound so cost is O(log N + K)
-// where K is the number of matching entries — no full tree walk.
 vector<IndexRecord> BPlusTree::Find_Range(int32_t lo, bool lo_inclusive, int32_t hi, bool hi_inclusive) const
 {
     vector<IndexRecord> results;
+    
     auto it = lo_inclusive ? index.lower_bound(lo) : index.upper_bound(lo);
-
     for (; it != index.end(); ++it)
     {
         if (hi_inclusive ? it->first > hi : it->first >= hi)
